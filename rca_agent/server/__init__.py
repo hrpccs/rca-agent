@@ -1,1 +1,4 @@
-"""server package (submodules added by the owning worker unit)."""
+"""FastAPI SSE server for the RCA agent."""
+from .app import app
+
+__all__ = ["app"]
