@@ -77,4 +77,17 @@ docker compose up -d clickhouse mysql otel-collector tempo grafana
 
 ## Verified at bring-up
 
-_(to be filled: timestamps, healthcheck results, sample query outputs)_
+Last verified bring-up (compose `up -d` of all 5 services):
+
+| Service | Status | Verified |
+|---|---|---|
+| ClickHouse | healthy | `SELECT` lists `rca`, `rca_otel` as user `rca`/`rca123` (HTTP `:8123`, native `:9000`) |
+| MySQL | healthy | `SHOW DATABASES` lists `rca` as user `rca`/`rca123` (root `root`/`root123`) |
+| OTel-collector | running | metrics endpoint `:8888` returns 200; clickhouse exporter loaded (sinks to `rca_otel`) |
+| Tempo | healthy | `GET :3200/ready` → `ready` |
+| Grafana | running | `GET :3000/api/health` → `{"database":"ok"}`, admin/admin; datasources Tempo+ClickHouse+MySQL provisioned |
+
+Reset after a config change to an infra file (e.g. `infra/otelcol/config.yaml`) requires a
+force-recreate, because bind-mounted config does not change the compose definition:
+`docker compose up -d --force-recreate otel-collector`.
+

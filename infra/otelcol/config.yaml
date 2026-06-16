@@ -40,7 +40,6 @@ exporters:
     username: rca
     password: rca123
     ttl: 168h
-    skip_table_creation: false
     timeout: 10s
     retry_on_failure:
       enabled: true

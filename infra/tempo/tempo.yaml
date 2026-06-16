@@ -22,5 +22,3 @@ storage:
       path: /var/tempo/blocks
     wal:
       path: /var/tempo/wal
-
-metrics_generator_enabled: false
