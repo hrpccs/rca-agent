@@ -41,26 +41,42 @@ You are a senior SRE performing root cause analysis on a production alert.
 def to_final_answer_guidance() -> str:
     """Describe the expected structure of the final root-cause answer.
 
-    Mirrors :class:`rca_agent.contracts.RootCause` so the model's free-text
-    conclusion can be parsed into the report schema downstream.
+    Mirrors :class:`rca_agent.contracts.RootCause`. The model MUST emit its
+    final answer as a single fenced ``json`` code block so it can be parsed into
+    the report schema; a bilingual free-form note is allowed beforehand but the
+    JSON block is required.
     """
     return (
-        "最终结论应包含以下结构化字段 / The final answer MUST contain these fields:\n"
-        "1. summary: 1-3 句话的根因总结（中文为主）。/ 1-3 sentence root-cause summary.\n"
-        "2. fault_type: 故障类型标签，如 'k8s.pod_crashloop' / 'app.exception' / "
-        "'infra.cpu_saturation' / 'dependency.timeout' / 'config.change'。\n"
-        "3. entity_refs: 根因指向的具体实体列表（service/pod/host/metric），"
-        "每项含 {entity_id|entity_name, entity_type, entity_domain}。/ Concrete entities.\n"
-        "4. evidence: 证据指针列表，每条指向一次工具观察，"
-        "如 'query_metrics: checkout cpu_usage > 0.95' 或 'query_logs: OOMKilled stack'。/ Evidence pointers.\n"
-        "5. confidence: 0-1 的置信度，并简述依据（证据链完整度）。/ Confidence with rationale.\n"
-        "6. contributing_factors: 促成因素（非根因但放大了影响）。/ Contributing factors.\n"
-        "7. recommended_actions: 建议处置（限流/扩容/回滚/SOP 链接）。/ Recommended actions.\n"
-        "\n约束 / Constraints:\n"
-        "- 根因必须落到具体实体，禁止笼统结论（如仅仅是‘流量上升’）。/ Must pin to a concrete entity.\n"
+        "# 最终结论格式 / Final-answer format (STRICT)\n"
+        "调查完成后，不要再调用任何工具。你的最后一条回复**必须**只包含一个 ```json 代码块"
+        "（代码块之外不要有任何额外文字），结构如下：\n"
+        "When you are done, DO NOT call any more tools. Your FINAL message MUST be a single "
+        "```json code block (nothing outside the block) with EXACTLY these keys:\n\n"
+        "```json\n"
+        "{\n"
+        '  "summary": "1-3 句根因总结（中文为主，落到具体实体与机制）/ 1-3 sentence root cause",\n'
+        '  "fault_type": "app.exception | k8s.pod_crashloop | infra.cpu_saturation | '
+        "dependency.timeout | config.change | ...\",\n"
+        '  "entity_refs": [\n'
+        '    {"entity_name": "payment", "entity_type": "apm.service", "entity_domain": "apm"}\n'
+        "  ],\n"
+        '  "evidence": [\n'
+        '    "query_logs: payment pods throw \'Invalid token. app.loyalty.level=gold\' at charge.js:65",\n'
+        '    "query_alerts: checkout error count 6180~8830/min (threshold 10)"\n'
+        "  ],\n"
+        '  "confidence": 0.0,\n'
+        '  "confidence_rationale": "证据链完整度说明",\n'
+        '  "contributing_factors": ["..."],\n'
+        '  "recommended_actions": ["回滚/限流/扩容/SOP 链接"]\n'
+        "}\n"
+        "```\n\n"
+        "约束 / Constraints:\n"
+        "- 根因必须落到具体实体（service/pod/host/代码位置/指标），禁止笼统结论。/ Must pin to a concrete entity.\n"
         "- evidence 必须可追溯到一次工具调用；未观察到的现象不得写入。/ Evidence must be tool-observed.\n"
-        "- 如果证据不足以定论，明确说明缺口并给出最可能的假设 + 置信度，而不是强行下结论。/ "
-        "If evidence is insufficient, state the gap and give the best-supported hypothesis with its confidence."
+        "- confidence 为 0-1 的小数，依据证据链完整度（证据闭合→0.8+，部分证据→0.5，推断→0.3）。/\n"
+        "  confidence reflects evidence-chain completeness.\n"
+        "- 如果证据不足，明确写出缺口并给出最可能假设 + 较低置信度，而不是强行下结论。/ "
+        "If evidence is insufficient, state the gap."
     )
 
 
