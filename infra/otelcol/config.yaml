@@ -1,0 +1,71 @@
+# OpenTelemetry Collector for the RCA agent.
+# Receives OTLP from the app (host 4317/4318) and fans out:
+#   traces  → Tempo (otlphttp)
+#   metrics → ClickHouse (rca_otel db; tables auto-created)
+#   logs    → ClickHouse (rca_otel db; tables auto-created)
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: dev
+        action: upsert
+
+exporters:
+  # Traces → Tempo over OTLP HTTP
+  otlphttp/tempo:
+    endpoint: http://tempo:4318
+    tls:
+      insecure: true
+
+  # Metrics + Logs → ClickHouse
+  clickhouse:
+    endpoint: tcp://clickhouse:9000
+    database: rca_otel
+    username: rca
+    password: rca123
+    ttl: 168h
+    skip_table_creation: false
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 60s
+
+  # Collector's own metrics + a debug tap
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [clickhouse]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [clickhouse]

@@ -1,0 +1,120 @@
+# RCA Agent infrastructure stack.
+# Brings up the external dependencies the system needs:
+#   - clickhouse : benchmark/observability data store (data-provider backend + OTel sink)
+#   - mysql      : rca-server persistence (cases, configs, runs, reports)
+#   - otel-collector : OTLP receiver → Tempo (traces) + ClickHouse (metrics/logs)
+#   - tempo      : distributed-trace backend (Grafana datasource)
+#   - grafana    : dashboards (Tempo + ClickHouse + MySQL datasources)
+#
+# Usage:  docker compose up -d clickhouse mysql otel-collector tempo grafana
+# Access: see docs/INFRA_ACCESS.md (host/port/user/password for every service).
+name: rca-agent
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: rca-clickhouse
+    ports:
+      - "8123:8123"  # HTTP interface (data provider, OTel)
+      - "9000:9000"  # native TCP (clickhouse-client)
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_DB: rca
+      CLICKHOUSE_USER: rca
+      CLICKHOUSE_PASSWORD: rca123
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./infra/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    container_name: rca-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: rca
+      MYSQL_USER: rca
+      MYSQL_PASSWORD: rca123
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - ./infra/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot123"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.6.0
+    container_name: rca-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./infra/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # tempo UI / metrics
+      # 4317/4318 are internal-only (used by otel-collector over the compose net)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3200/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.108.0
+    container_name: rca-otelcol
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./infra/otelcol/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"  # OTLP gRPC (app exports here)
+      - "4318:4318"  # OTLP HTTP
+      - "8888:8888"  # collector metrics
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      tempo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: rca-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: "grafana-clickhouse-datasource"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - tempo
+      - clickhouse
+      - mysql
+    restart: unless-stopped
+
+volumes:
+  clickhouse-data:
+  mysql-data:
+  tempo-data:
+  grafana-data:
