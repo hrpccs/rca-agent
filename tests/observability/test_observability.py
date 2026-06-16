@@ -169,6 +169,8 @@ def test_setup_otel_is_idempotent(monkeypatch):
 
 def test_setup_otel_disabled_is_noop(monkeypatch):
     monkeypatch.setattr(t, "_initialized", False)
+    monkeypatch.setattr(t, "_tracer_provider", None)
+    monkeypatch.setattr(t, "_meter_provider", None)
     monkeypatch.setenv("RCA_OTEL_ENABLED", "false")
     get_settings.cache_clear()
     t.setup_otel()
