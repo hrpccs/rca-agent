@@ -127,10 +127,15 @@ export function openRcaStream(
     es.addEventListener(k, makeListener(k) as EventListener);
   });
 
-  // If the transport itself fails (network, CORS, non-200), surface it once.
+  // If the transport itself fails (network down, non-200, CORS), EventSource
+  // fires `error` and auto-retries while CONNECTING, then ends in CLOSED.
+  // Surface once when the connection has truly failed (CLOSED) so callers can
+  // stop the run instead of waiting on retries that will never deliver data.
+  let nativeErrorSurfaced = false;
   es.onerror = () => {
-    // Only surface if still connecting/open and not already closed by done/error.
+    if (nativeErrorSurfaced) return;
     if (es.readyState === EventSource.CLOSED) {
+      nativeErrorSurfaced = true;
       handlers.onError?.(`stream closed for case ${caseId}`, {
         event: "error",
         case_id: caseId,
