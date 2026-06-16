@@ -37,14 +37,21 @@ _STOPWORDS = frozenset(
     """.split()
 )
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+# Latin/alphanumeric runs OR individual CJK ideographs (so localized — incl.
+# Chinese, the dominant language of the rca100 corpus — is searchable
+# character-by-character rather than dropped entirely).
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[一-鿿㐀-䶿가-힯]")
 
 
 def _tokenize(text: str) -> list[str]:
-    """Lowercase + word-boundary tokenization. Keeps alphanumerics."""
+    """Unicode-aware tokenization.
+
+    Latin/alphanumeric runs are lowercased; each CJK/Hangul ideograph is its own
+    token. Keeps the content searchable for both English and Chinese queries.
+    """
     if not text:
         return []
-    return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS]
+    return [t for t in (tok.lower() for tok in _TOKEN_RE.findall(text)) if t not in _STOPWORDS]
 
 
 def _term_freq(tokens: list[str]) -> dict[str, float]:
@@ -84,18 +91,25 @@ def _tfidf_score(query_tf: dict[str, float], doc_tf: dict[str, float],
 
 
 def _keyword_overlap(query_tokens: list[str], doc_tokens: list[str]) -> float:
-    """Fallback relevance: fraction of query tokens present in the doc
-    (Jaccard-like). Used when the pool is tiny or the query is very short, where
-    TF-IDF IDF estimates are unreliable."""
+    """Fallback relevance: fraction of query tokens present in the doc, with
+    substring matching so a short query term that is a substring of a doc term
+    (e.g. ``oom`` vs ``oomkill``) still scores. Used when the pool is tiny or the
+    query is very short, where TF-IDF IDF estimates are unreliable."""
     if not query_tokens:
         return 0.0
     qset = set(query_tokens)
     dset = set(doc_tokens)
-    hits = qset & dset
+    hits = 0
+    doc_blob = " ".join(doc_tokens)
+    for q in qset:
+        # whole-token match, else substring containment (either direction for
+        # short CJK chars / abbreviations).
+        if q in dset or q in doc_blob or any(q in d or d in q for d in dset):
+            hits += 1
     if not hits:
         return 0.0
-    # Weight recall (how many query terms matched) plus a small precision term.
-    return len(hits) / len(qset)
+    # Weight recall (how many query terms matched).
+    return hits / len(qset)
 
 
 class InMemoryStore:
@@ -108,21 +122,21 @@ class InMemoryStore:
 
     def __init__(self) -> None:
         self._items: dict[str, list[MemoryItem]] = {}
+        self._counter: int = 0  # monotonic id source (NOT bucket count)
 
     # ------------------------------------------------------------------ #
     # Indexing
     # ------------------------------------------------------------------ #
     def index(self, items: list[MemoryItem]) -> None:
-        """Append items; assign a stable id to any item missing one.
+        """Append items; assign a stable, unique id to any item missing one.
 
         Items are appended (never replaced) so per-run evidence accumulates over
         a case's lifetime. ``clear()`` is the intended reset path.
         """
-        for idx, it in enumerate(items):
+        for it in items:
             if not it.id:
-                # Assign a unique-ish id scoped to this index call. Pydantic
-                # models are mutable by default, so we can set .id in place.
-                it.id = f"mem-{len(self._items) + idx}"
+                self._counter += 1
+                it.id = f"mem-{self._counter}"
             self._items.setdefault(it.case_id, []).append(it)
 
     # ------------------------------------------------------------------ #
@@ -167,11 +181,10 @@ class InMemoryStore:
         if top_k == 0:
             return []
 
-        # No query text: stable order, no scoring.
+        # No query text: stable order, no scoring. Return copies so callers'
+        # earlier results are not mutated by later retrievals.
         if not q.text or not q.text.strip():
-            for i in pool[:top_k]:
-                i.score = 0.0
-            return pool[:top_k]
+            return [i.model_copy(update={"score": 0.0}) for i in pool[:top_k]]
 
         query_tokens = _tokenize(q.text)
 
@@ -186,11 +199,13 @@ class InMemoryStore:
         # Stable sort: score desc, then insertion order (preserved via Python's
         # stable sort keyed solely on -score).
         scored.sort(key=lambda pair: -pair[1])
-        results: list[MemoryItem] = []
-        for item, score in scored[:top_k]:
-            item.score = round(score, 6)
-            results.append(item)
-        return results
+        # Return copies with the score set, so stored items are never mutated
+        # (a later retrieve() with different text must not retroactively change
+        # a caller's held result scores).
+        return [
+            item.model_copy(update={"score": round(score, 6)})
+            for item, score in scored[:top_k]
+        ]
 
     @staticmethod
     def _rank_tfidf(query_tokens: list[str],
@@ -276,14 +291,19 @@ class InMemoryStore:
         for fp in files:
             try:
                 raw = fp.read_text(encoding="utf-8")
-            except OSError:
+            except (OSError, UnicodeDecodeError):
+                # Bad/missing file — skip it, don't take down seed loading.
                 continue
             kind, body = cls._parse_seed(raw)
+            body = body.strip()
+            if not body:
+                # Degenerate (front-matter-only) seed: nothing retrievable; skip.
+                continue
             store.index([
                 MemoryItem(
                     id=fp.stem,
                     case_id=case_id,
-                    content=body.strip(),
+                    content=body,
                     kind=kind,
                     source_tool="seed",
                     meta={"source_path": str(fp)},
@@ -313,31 +333,22 @@ class InMemoryStore:
                         kind = value.strip() or kind
                         break
                 return kind, text.lstrip("\n")
-        # Otherwise, parse leading ``key: value`` lines until a blank line.
+        # Otherwise: recognize ONLY a single leading ``kind: value`` line (the
+        # first non-blank line). All other ``key: value`` lines are preserved as
+        # body, so authored content like "service: checkout" / "alert: 5xx" is
+        # never stripped as front-matter.
         lines = text.splitlines()
-        consumed = 0
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                # blank line ends any leading meta run
-                if consumed:
-                    break
-                continue
+        start = 0
+        while start < len(lines) and not lines[start].strip():
+            start += 1
+        if start < len(lines):
+            stripped = lines[start].strip()
             if ":" in stripped and not stripped.startswith("#"):
                 key, _, value = stripped.partition(":")
-                key = key.strip().lower()
-                value = value.strip()
-                if key == "kind":
-                    kind = value or kind
-                    consumed += 1
-                    continue
-                # unknown key but still a meta line: consume if at top
-                if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_\-]*", key) and value:
-                    consumed += 1
-                    continue
-            break
-        if consumed:
-            text = "\n".join(lines[consumed:]).lstrip("\n")
+                if key.strip().lower() == "kind":
+                    kind = value.strip() or kind
+                    lines = lines[:start] + lines[start + 1:]
+                    text = "\n".join(lines).lstrip("\n")
         return kind, text
 
 
