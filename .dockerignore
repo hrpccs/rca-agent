@@ -1,0 +1,20 @@
+# Keep images lean — never bake the dataset, venvs, or caches.
+.git/
+.gitignore
+.github/
+.claude/
+.venv/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+runs/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+# The 3.4GB benchmark dataset is mounted at runtime, not baked in:
+data/
+# Local secrets:
+.env

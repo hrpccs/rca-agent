@@ -1,0 +1,54 @@
+# Production app profile for rca-agent. Brings up the server + frontend on top of
+# the infra defined in docker-compose.yml.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile app up -d --build
+#   # server: http://localhost:8000  frontend: http://localhost:8080
+#
+# The benchmark dataset is mounted read-only (NOT baked into the image).
+services:
+  rca-server:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: rca-agent/server:latest
+    container_name: rca-server
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      RCA_CASES_DIR: /data/cases
+      RCA_DATA_BACKEND: ${RCA_DATA_BACKEND:-parquet}
+      RCA_OTEL_ENDPOINT: http://otel-collector:4317
+      RCA_MYSQL_URL: mysql+pymysql://rca:rca123@mysql:3306/rca
+      RCA_CLICKHOUSE_HOST: clickhouse
+      RCA_SERVER_HOST: 0.0.0.0
+    volumes:
+      - ${RCA_CASES_DIR:-/Users/hrpccs/Desktop/workspace/aiops/rca100/cases}:/data/cases:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    profiles: ["app"]
+
+  rca-frontend:
+    build:
+      context: .
+      dockerfile: deploy/frontend.Dockerfile
+    image: rca-agent/frontend:latest
+    container_name: rca-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      rca-server:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles: ["app"]

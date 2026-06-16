@@ -1,1 +1,4 @@
-"""eval package (submodules added by the owning worker unit)."""
+"""Benchmark / evaluation runner for the RCA agent."""
+from .runner import run_eval
+
+__all__ = ["run_eval"]
