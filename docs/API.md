@@ -255,3 +255,9 @@ Note the SSE convention: the browser's `EventSource` delivers the `data:` line
 to the typed listener; the `event:` line selects the listener. The `data` JSON
 is the full `SSEEvent` envelope (`{event, case_id, data, seq}`), and the
 investigation payload lives at `.data` inside it.
+
+---
+
+> See [`TRACES.md`](TRACES.md) for the trace *model* (runs / steps / step kinds),
+> SSE resilience (heartbeat + nginx hardening), and the `runs` / `trace` CLI
+> subcommands for inspecting persisted traces from the shell.

@@ -3,6 +3,8 @@
 Subcommands:
   cases                 list available benchmark cases
   run <case>            run the RCA agent on a case (parquet|clickhouse backend)
+  runs                  list persisted RCA reports (the durable run + step trace)
+  trace <report_id>     print one report's full ordered step trace
   llm ping              one real DeepSeek call (verifies thinking mode)
   data <case> <mod>     dump a sample of one data modality for a case
   import-case <case>    import a case into ClickHouse
@@ -12,6 +14,7 @@ Subcommands:
 The CLI clears SOCKS/HTTP proxy env vars at startup because the dev machine's
 shell profile exports a SOCKS proxy that breaks the openai/httpx client.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -19,14 +22,25 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# A stored report/run id is a 32-char hex uuid (MysqlStore mints uuid4().hex).
+# Used to validate the positional id of ``trace`` before hitting the store.
+_REPORT_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
 _PROXY_VARS = (
-    "all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY",
-    "https_proxy", "HTTPS_PROXY", "socks_proxy", "SOCKS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "socks_proxy",
+    "SOCKS_PROXY",
 )
 
 
@@ -58,7 +72,9 @@ def _configure_logging() -> None:
         return
     level_name = os.environ.get("RCA_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(level=level, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=level, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s"
+    )
 
 
 def _cmd_cases(args: argparse.Namespace) -> int:
@@ -85,7 +101,10 @@ def _print_step(step) -> None:
         if kind == "reasoning":
             print(f"\n[thought] {step.thought}"[:600], flush=True)
         elif kind == "tool_call":
-            print(f"\n→ tool_call: {step.tool_name} {json.dumps(step.tool_args, ensure_ascii=False)}", flush=True)
+            print(
+                f"\n→ tool_call: {step.tool_name} {json.dumps(step.tool_args, ensure_ascii=False)}",
+                flush=True,
+            )
         elif kind == "tool_result":
             txt = (step.tool_result_text or "")[:700]
             print(f"← {step.tool_name}: {txt}", flush=True)
@@ -97,6 +116,54 @@ def _print_step(step) -> None:
             logger.debug("unhandled step_kind %s; not rendered", kind)
     except Exception as exc:  # noqa: BLE001 — renderer must not crash the run
         logger.warning("failed to render step: %r (%s)", step, exc)
+
+
+def _print_trace_step(idx: int, step) -> None:
+    """Render one persisted step in the ``trace`` listing.
+
+    Unlike :func:`_print_step` (which is tuned for the live ``run`` stream and
+    silently skips unknown kinds), this renders *every* step_kind via this
+    dedicated renderer so a stored trace never hides
+    observe/hypothesize/investigate steps. Each line shows the 1-based index,
+    kind, tool name (if any), a truncated thought / tool result / tool args,
+    and the timestamp. Defensive: a malformed step is logged and skipped, never
+    aborting the whole trace.
+    """
+    try:
+        raw_kind = getattr(step, "step_kind", None)
+        kind = raw_kind.value if hasattr(raw_kind, "value") else str(raw_kind)
+        ts = getattr(step, "ts", None)
+        ts_s = ts.isoformat() if hasattr(ts, "isoformat") else (ts if ts else "-")
+        tool = getattr(step, "tool_name", None)
+        head = f"#{idx:<3} {kind:<12}"
+        if tool:
+            head += f" tool={tool}"
+        # Prefer the most informative text the step carries.
+        parts: list[str] = []
+        if kind == "conclude":
+            conf = getattr(step, "confidence", None)
+            hyp = getattr(step, "hypothesis", None)
+            # confidence may be 0.0 (falsy!) — only drop it when truly absent.
+            if conf is not None:
+                parts.append(f"conf={conf}")
+            if hyp:
+                parts.append(str(hyp))
+        else:
+            txt = getattr(step, "thought", None) or getattr(step, "tool_result_text", None)
+            if txt:
+                parts.append(str(txt))
+        # For a tool_call, surface the args too (truncated) when no result text.
+        if kind == "tool_call":
+            targs = getattr(step, "tool_args", None)
+            if targs:
+                parts.append(json.dumps(targs, ensure_ascii=False))
+        detail = " ".join(parts)
+        if detail:
+            detail = detail.replace("\n", " ").strip()
+            head += f" :: {detail[:240]}"
+        print(f"{head}  [{ts_s}]", flush=True)
+    except Exception as exc:  # noqa: BLE001 — renderer must not crash the trace
+        logger.warning("failed to render trace step #%s: %r (%s)", idx, step, exc)
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -128,10 +195,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"FAULT TYPE: {rc.fault_type or '(unspecified)'}", flush=True)
     print(f"ROOT CAUSE: {rc.summary}", flush=True)
     if rc.entity_refs:
-        print("ENTITIES:", ", ".join(
-            (e.get("entity_name") or e.get("entity_id") or "?") if isinstance(e, dict) else str(e)
-            for e in rc.entity_refs
-        ), flush=True)
+        print(
+            "ENTITIES:",
+            ", ".join(
+                (e.get("entity_name") or e.get("entity_id") or "?")
+                if isinstance(e, dict)
+                else str(e)
+                for e in rc.entity_refs
+            ),
+            flush=True,
+        )
     if rc.evidence:
         print("EVIDENCE:", flush=True)
         for ev in rc.evidence[:8]:
@@ -193,7 +266,9 @@ def _cmd_data(args: argparse.Namespace) -> int:
             print(r.subject, r.severity, r.status)
         print(f"({len(rows)} alerts)")
     elif mod == "metrics":
-        rows = provider.query_metrics(MetricFilter(window=w, services=[args.filter] if args.filter else None, limit=20))
+        rows = provider.query_metrics(
+            MetricFilter(window=w, services=[args.filter] if args.filter else None, limit=20)
+        )
         for r in rows[:20]:
             print(r.entity_name, r.metric, r.summary_stats())
         print(f"({len(rows)} series)")
@@ -203,14 +278,25 @@ def _cmd_data(args: argparse.Namespace) -> int:
             print(r.pod, "::", r.content[:160])
         print(f"({len(rows)} logs)")
     elif mod == "traces":
-        rows = provider.query_traces(TraceFilter(window=w, service_names=[args.filter] if args.filter else None, limit=5))
+        rows = provider.query_traces(
+            TraceFilter(window=w, service_names=[args.filter] if args.filter else None, limit=5)
+        )
         for t in rows[:5]:
             try:
                 sp = t.slowest_span()
             except Exception as exc:  # noqa: BLE001 — one bad trace must not abort the dump
-                logger.warning("trace %s: slowest_span() failed: %s", getattr(t, "trace_id", "?"), exc)
+                logger.warning(
+                    "trace %s: slowest_span() failed: %s", getattr(t, "trace_id", "?"), exc
+                )
                 sp = None
-            print(t.trace_id[:12], "spans:", len(t.spans), "slowest:", sp.name if sp else "-", sp.duration_ns if sp else "")
+            print(
+                t.trace_id[:12],
+                "spans:",
+                len(t.spans),
+                "slowest:",
+                sp.name if sp else "-",
+                sp.duration_ns if sp else "",
+            )
         print(f"({len(rows)} traces)")
     elif mod == "events":
         rows = provider.query_events(EventFilter(window=w, limit=20))
@@ -260,11 +346,152 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def _new_store():
+    """Construct the production MySQL store.
+
+    Imported lazily so importing ``rca_agent.cli`` (e.g. by the server) does not
+    build a SQLAlchemy engine at module load. Mirrors the lazy construction used
+    elsewhere in this module (``build_agent_for_case``, ``default_client``).
+    """
+    from .store.mysql_store import MysqlStore
+
+    return MysqlStore()
+
+
+def _cmd_runs(args: argparse.Namespace) -> int:
+    """List persisted RCA reports (the durable per-case run + step trace).
+
+    Today a persisted run == one ``rca_reports`` row (its ``steps_json`` carries
+    the full ordered ``RcaStep`` list). ``--case`` filters, ``--limit`` caps the
+    page (default 50, matching ``list_reports``). The table is human-readable;
+    errors surface as a clear stderr message + non-zero exit, never a traceback.
+    """
+    from .store.mysql_store import StoreError
+
+    try:
+        store = _new_store()
+        reports = store.list_reports(case_id=args.case, limit=args.limit)
+    except StoreError as exc:
+        print(f"error: could not list runs: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 — CLI surface; never crash with a traceback
+        logger.error("runs: store list failed: %s", exc, exc_info=True)
+        print(f"error: could not list runs: {exc}", file=sys.stderr)
+        return 1
+
+    if not reports:
+        where = f" for case {args.case}" if args.case else ""
+        print(f"no runs found{where}.", flush=True)
+        return 0
+
+    print(f"{len(reports)} run(s):", flush=True)
+    # Today a persisted run's stable key is its case_id (the server's
+    # ``/reports/{case_id}`` returns the most recent report for a case). The
+    # ``trace`` subcommand takes a 32-char hex report_id; use ``trace`` on the
+    # id logged by the server's report-persist path, or re-run via ``run -o``.
+    for r in reports:
+        cid = getattr(r, "case_id", "?")
+        status = getattr(r, "status", "?")
+        model = getattr(r, "model", None) or "-"
+        steps = len(getattr(r, "steps", []) or [])
+        print(f"  case={cid}  status={status}  model={model}  steps={steps}", flush=True)
+    print(
+        "\n(tip: `rca-agent trace <report_id>` prints a run's full step trace; "
+        "get a report_id from the server's report-persist log or `run -o`.)",
+        flush=True,
+    )
+    return 0
+
+
+def _cmd_trace(args: argparse.Namespace) -> int:
+    """Print one report's full ordered step trace.
+
+    ``report_id`` must be a 32-char hex uuid (the id returned by ``runs`` /
+    ``save_report``). Prints the run header then each ``RcaStep`` in order via
+    the shared ``_print_step`` renderer. Unknown id / store error / bad id all
+    surface as a clear stderr message + non-zero exit, never a traceback.
+    """
+    from .store.mysql_store import StoreError
+
+    rid = args.report_id
+    if not _REPORT_ID_RE.match(rid):
+        print(
+            f"error: '{rid}' is not a valid report id (expected 32-char hex uuid)",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        store = _new_store()
+        report = store.get_report(rid)
+    except StoreError as exc:
+        print(f"error: could not read run {rid}: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 — CLI surface; never crash with a traceback
+        logger.error("trace: store get failed for %s: %s", rid, exc, exc_info=True)
+        print(f"error: could not read run {rid}: {exc}", file=sys.stderr)
+        return 1
+
+    if report is None:
+        print(f"error: no such run: {rid}", file=sys.stderr)
+        return 1
+
+    rc = report.root_cause
+    print(f"=== trace {rid} :: case={report.case_id} ===", flush=True)
+    print(
+        f"status={report.status}  model={report.model or '-'}  "
+        f"steps={len(report.steps)}  confidence={rc.confidence}",
+        flush=True,
+    )
+    print(f"alert: {report.alert_title}", flush=True)
+    for i, step in enumerate(report.steps):
+        _print_trace_step(i + 1, step)
+    print("\n" + "=" * 70, flush=True)
+    print(f"ROOT CAUSE: {rc.summary}", flush=True)
+    if rc.fault_type:
+        print(f"FAULT TYPE: {rc.fault_type}", flush=True)
+    if report.token_usage:
+        print(f"TOKENS: {report.token_usage}", flush=True)
+    return 0
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var, falling back to ``default`` on missing/bad values.
+
+    A non-numeric value (e.g. ``RCA_RUNS_LIMIT=unlimited``) logs a warning and
+    uses the default rather than crashing ``build_parser()`` — which runs before
+    ``main()``'s try/except, so an uncaught ``ValueError`` would surface as a raw
+    traceback.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("env %s=%r is not an int; using default %s", name, raw, default)
+        return default
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="rca-agent", description="LLM-core RCA agent CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("cases", help="list benchmark cases").set_defaults(func=_cmd_cases)
+
+    pruns = sub.add_parser("runs", help="list persisted RCA runs (reports)")
+    pruns.add_argument("--case", default=None, help="filter by case_id")
+    pruns.add_argument(
+        "--limit",
+        type=int,
+        default=_env_int("RCA_RUNS_LIMIT", 50),
+        help="max runs to list (env RCA_RUNS_LIMIT, default 50)",
+    )
+    pruns.set_defaults(func=_cmd_runs)
+
+    ptrace = sub.add_parser("trace", help="print a run's full ordered step trace")
+    ptrace.add_argument("report_id", help="32-char hex report/run id (see `runs`)")
+    ptrace.set_defaults(func=_cmd_trace)
 
     pr = sub.add_parser("run", help="run the RCA agent on a case")
     pr.add_argument("case")
@@ -278,8 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     pd = sub.add_parser("data", help="dump a sample of a data modality")
     pd.add_argument("case")
-    pd.add_argument("modality", choices=["alerts", "metrics", "logs", "traces", "events", "topology"])
-    pd.add_argument("--filter", default=None, help="service / pod / substring depending on modality")
+    pd.add_argument(
+        "modality", choices=["alerts", "metrics", "logs", "traces", "events", "topology"]
+    )
+    pd.add_argument(
+        "--filter", default=None, help="service / pod / substring depending on modality"
+    )
     pd.set_defaults(func=_cmd_data)
 
     pi = sub.add_parser("import-case", help="import a case into ClickHouse")
