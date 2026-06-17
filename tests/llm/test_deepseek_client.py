@@ -8,11 +8,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import httpx
 import pytest
 import respx
 
 from rca_agent.contracts.llm import DeltaKind, LLMRequest
 from rca_agent.llm.deepseek_client import DeepSeekClient, default_client
+from tests.llm.conftest import _resp, install_sequence
 
 
 # --------------------------------------------------------------------------- #
@@ -271,6 +273,176 @@ async def test_complete_raises_on_api_error(base_url: str) -> None:
         )
         with pytest.raises(RuntimeError, match="rate limited"):
             await client.complete(LLMRequest(messages=[{"role": "user", "content": "hi"}]))
+
+
+# --------------------------------------------------------------------------- #
+# Retry (U7)
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_complete_retries_transient_then_succeeds(
+    base_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient 429 on attempt 0 must be retried; the retried request must
+    still succeed and echo reasoning_content. Exactly 2 HTTP calls."""
+    monkeypatch.setenv("RCA_LLM_MAX_RETRIES", "3")
+    monkeypatch.setenv("RCA_LLM_RETRY_BASE", "0.001")  # near-zero backoff
+    ok_body = _sse([_chunk(reasoning="plan"), _chunk(content="42"), "[DONE]"])
+    client = DeepSeekClient(api_key="sk-test", base_url=base_url)
+    async with respx.mock(base_url=base_url + "/", assert_all_called=False) as mock:
+        route = install_sequence(
+            mock,
+            [
+                _resp(
+                    429,
+                    '{"error":{"message":"rate limited","type":"rate_limit_error"}}',
+                ),
+                _resp(200, ok_body, content_type="text/event-stream"),
+            ],
+        )
+        content, reasoning, _tc, _u = await client.complete(
+            LLMRequest(messages=[{"role": "user", "content": "hi"}])
+        )
+    assert route.call_count == 2
+    assert content == "42"
+    # reasoning_content is still echoed on the retried (successful) request.
+    assert reasoning == "plan"
+
+
+@pytest.mark.asyncio
+async def test_complete_retries_timeout_then_succeeds(
+    base_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An httpx connect timeout is transient: retried once, then succeeds."""
+    monkeypatch.setenv("RCA_LLM_MAX_RETRIES", "3")
+    monkeypatch.setenv("RCA_LLM_RETRY_BASE", "0.001")
+    ok_body = _sse([_chunk(content="ok"), "[DONE]"])
+    client = DeepSeekClient(api_key="sk-test", base_url=base_url)
+    async with respx.mock(base_url=base_url + "/", assert_all_called=False) as mock:
+        route = install_sequence(
+            mock,
+            [
+                httpx.ConnectTimeout("simulated timeout"),
+                _resp(200, ok_body, content_type="text/event-stream", base=base_url),
+            ],
+        )
+        content, _reasoning, _tc, _u = await client.complete(
+            LLMRequest(messages=[{"role": "user", "content": "hi"}])
+        )
+    assert route.call_count == 2
+    assert content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_complete_exhausts_retries_on_persistent_503(
+    base_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persistent 503 must be retried up to max_retries then raised. The
+    terminal ERROR surfaces through complete() as RuntimeError."""
+    monkeypatch.setenv("RCA_LLM_MAX_RETRIES", "2")
+    monkeypatch.setenv("RCA_LLM_RETRY_BASE", "0.001")
+    client = DeepSeekClient(api_key="sk-test", base_url=base_url)
+    async with respx.mock(base_url=base_url + "/", assert_all_called=False) as mock:
+        route = install_sequence(
+            mock,
+            [
+                _resp(503, '{"error":{"message":"down","type":"server_error"}}'),
+                _resp(503, '{"error":{"message":"down","type":"server_error"}}'),
+                _resp(503, '{"error":{"message":"down","type":"server_error"}}'),
+            ],
+        )
+        with pytest.raises(RuntimeError, match="down"):
+            await client.complete(LLMRequest(messages=[{"role": "user", "content": "hi"}]))
+    # 1 initial + 2 retries = 3 attempts.
+    assert route.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_complete_does_not_retry_non_retryable_400(
+    base_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 400 (not in the retryable set) must NOT be retried: exactly 1 call."""
+    monkeypatch.setenv("RCA_LLM_MAX_RETRIES", "3")
+    monkeypatch.setenv("RCA_LLM_RETRY_BASE", "0.001")
+    client = DeepSeekClient(api_key="sk-test", base_url=base_url)
+    async with respx.mock(base_url=base_url + "/", assert_all_called=False) as mock:
+        route = install_sequence(
+            mock,
+            [_resp(400, '{"error":{"message":"bad request","type":"invalid_request_error"}}')],
+        )
+        with pytest.raises(RuntimeError, match="bad request"):
+            await client.complete(LLMRequest(messages=[{"role": "user", "content": "hi"}]))
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_no_error_single_call_no_sleep(
+    base_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a clean 200 the client makes exactly 1 call and never sleeps."""
+    monkeypatch.setenv("RCA_LLM_MAX_RETRIES", "3")
+    monkeypatch.setenv("RCA_LLM_RETRY_BASE", "0.001")
+    slept: list[float] = []
+    # Monkeypatch the module's asyncio.sleep to detect any backoff.
+    import rca_agent.llm.deepseek_client as mod
+
+    real_sleep = mod.asyncio.sleep
+
+    async def fake_sleep(d: float) -> None:
+        slept.append(d)
+        await real_sleep(0)
+
+    monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+    ok_body = _sse([_chunk(content="hi"), "[DONE]"])
+    client = DeepSeekClient(api_key="sk-test", base_url=base_url)
+    async with respx.mock(base_url=base_url + "/", assert_all_called=False) as mock:
+        route = install_sequence(mock, [_resp(200, ok_body, content_type="text/event-stream")])
+        content, _r, _tc, _u = await client.complete(
+            LLMRequest(messages=[{"role": "user", "content": "hi"}])
+        )
+    assert route.call_count == 1
+    assert content == "hi"
+    assert slept == [], f"expected no backoff sleep on clean call, got {slept}"
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_error_on_non_retryable_401(
+    base_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """stream() surfaces a non-retryable APIStatusError (401, not in the
+    retryable set) as a single terminal ERROR delta (no DONE), honoring the
+    streaming contract. Exactly 1 call regardless of the retry budget."""
+    monkeypatch.setenv("RCA_LLM_MAX_RETRIES", "3")
+    monkeypatch.setenv("RCA_LLM_RETRY_BASE", "0.001")
+    client = DeepSeekClient(api_key="sk-test", base_url=base_url)
+    async with respx.mock(base_url=base_url + "/", assert_all_called=False) as mock:
+        route = install_sequence(
+            mock,
+            [_resp(401, '{"error":{"message":"bad key","type":"invalid_request_error"}}')],
+        )
+        deltas = [d async for d in client.stream(LLMRequest(messages=[{"role": "user", "content": "hi"}]))]
+    assert route.call_count == 1
+    errs = [d for d in deltas if d.kind is DeltaKind.ERROR]
+    assert len(errs) == 1
+    assert "bad key" in errs[0].error
+    assert DeltaKind.DONE not in [d.kind for d in deltas]
+
+
+def test_retry_tunables_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without env overrides the defaults are max_retries=3, base=0.5s."""
+    from rca_agent.llm.deepseek_client import _retry_tunables
+
+    monkeypatch.delenv("RCA_LLM_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("RCA_LLM_RETRY_BASE", raising=False)
+    assert _retry_tunables() == (3, 0.5)
+
+
+def test_retry_tunables_invalid_env_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Garbage env values fall back to defaults rather than crashing."""
+    from rca_agent.llm.deepseek_client import _retry_tunables
+
+    monkeypatch.setenv("RCA_LLM_MAX_RETRIES", "not-a-number")
+    monkeypatch.setenv("RCA_LLM_RETRY_BASE", "oops")
+    assert _retry_tunables() == (3, 0.5)
 
 
 # --------------------------------------------------------------------------- #
