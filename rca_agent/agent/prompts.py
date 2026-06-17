@@ -7,6 +7,7 @@ parse logic.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from typing import Any
@@ -230,17 +231,17 @@ def parse_root_cause(content: str | None) -> RootCause:
         evidence.extend(_bullets(secs.get("evidence", "")))
 
         actions = _bullets(secs.get("recommended_actions", "")) or [
-            _strip_md(l) for l in secs.get("recommended_actions", "").splitlines() if l.strip()
+            _strip_md(line)
+            for line in secs.get("recommended_actions", "").splitlines()
+            if line.strip()
         ]
         contrib = _bullets(secs.get("contributing_factors", ""))
 
         confidence = 0.5
         cm = re.search(r"([0-9]*\.?[0-9]+)", secs.get("confidence", ""))
         if cm:
-            try:
+            with contextlib.suppress(ValueError):
                 confidence = max(0.0, min(1.0, float(cm.group(1))))
-            except ValueError:
-                pass
 
         return RootCause(
             summary=summary or content.strip()[:1200],
