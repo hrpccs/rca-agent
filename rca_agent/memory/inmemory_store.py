@@ -17,6 +17,7 @@ loader tolerates the directory being absent (another worker owns creating it).
 from __future__ import annotations
 
 import math
+import os
 import re
 from pathlib import Path
 
@@ -26,6 +27,10 @@ from rca_agent.contracts import MemoryItem, MemoryQuery, MemoryStore
 __all__ = ["InMemoryStore", "build_memory"]
 
 GLOBAL = "__global__"
+
+# Env var name for the optional per-bucket max-items cap. Default ``"0"`` means
+# UNBOUNDED, preserving the original append-only behavior exactly.
+MAX_PER_BUCKET_ENV = "RCA_MEMORY_MAX_PER_BUCKET"
 
 # Tiny stoplist to keep TF-IDF term frequencies meaningful for short SRE texts.
 _STOPWORDS = frozenset(
@@ -123,6 +128,25 @@ class InMemoryStore:
     def __init__(self) -> None:
         self._items: dict[str, list[MemoryItem]] = {}
         self._counter: int = 0  # monotonic id source (NOT bucket count)
+        # Optional per-bucket FIFO cap. Parsed ONCE at init from the env var;
+        # 0 (or any non-positive / unparseable value) means UNBOUNDED, which
+        # preserves the original append-only behavior exactly.
+        self._max_per_bucket: int = self._parse_max_per_bucket(
+            os.environ.get(MAX_PER_BUCKET_ENV, "0")
+        )
+
+    @staticmethod
+    def _parse_max_per_bucket(raw: str) -> int:
+        """Parse ``RCA_MEMORY_MAX_PER_BUCKET`` once at init.
+
+        Non-positive or unparseable values resolve to ``0`` = UNBOUNDED so a
+        misconfigured env var never silently truncates memory.
+        """
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
 
     # ------------------------------------------------------------------ #
     # Indexing
@@ -132,12 +156,24 @@ class InMemoryStore:
 
         Items are appended (never replaced) so per-run evidence accumulates over
         a case's lifetime. ``clear()`` is the intended reset path.
+
+        When ``RCA_MEMORY_MAX_PER_BUCKET`` > 0, each bucket is bounded: after
+        appending, the OLDEST items (FIFO — front of the list) are dropped until
+        the bucket is at or below the cap. A cap of ``0`` (the default) leaves
+        buckets UNBOUNDED, preserving the original behavior exactly.
         """
         for it in items:
             if not it.id:
                 self._counter += 1
                 it.id = f"mem-{self._counter}"
-            self._items.setdefault(it.case_id, []).append(it)
+            bucket = self._items.setdefault(it.case_id, [])
+            bucket.append(it)
+            cap = self._max_per_bucket
+            # FIFO eviction: drop oldest (front) items when the cap is exceeded.
+            # ``cap == 0`` means unbounded — the guard short-circuits.
+            if cap > 0 and len(bucket) > cap:
+                # Slice off the surplus from the FRONT (oldest first).
+                del bucket[: len(bucket) - cap]
 
     # ------------------------------------------------------------------ #
     # Retrieval
