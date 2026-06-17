@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchCases, openRcaStream, startRca, type StreamHandlers } from "./api";
+import {
+  fetchCases,
+  openRcaStream,
+  startRca,
+  type RcaStreamHandle,
+  type StreamHandlers,
+} from "./api";
 import type { Backend, RcaReport, RcaStep } from "./types";
 import { CasePicker } from "./components/CasePicker";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ReportCard } from "./components/ReportCard";
 import { RunPanel } from "./components/RunPanel";
 import { TraceTimeline } from "./components/TraceTimeline";
@@ -22,7 +29,7 @@ export default function App() {
 
   const [elapsedMs, setElapsedMs] = useState(0);
 
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const eventSourceRef = useRef<RcaStreamHandle | null>(null);
   const tickerRef = useRef<number | null>(null);
   // Ref mirror of the run start timestamp so stream callbacks read the latest
   // value without needing to re-bind the handlers.
@@ -46,7 +53,9 @@ export default function App() {
 
   const closeStream = useCallback(() => {
     if (eventSourceRef.current) {
-      eventSourceRef.current.close();
+      // dispose() closes the EventSource AND cancels the SSE idle watchdog,
+      // so a stopped run can never fire a spurious onError ~60s later.
+      eventSourceRef.current.dispose();
       eventSourceRef.current = null;
     }
     if (tickerRef.current != null) {
@@ -160,22 +169,35 @@ export default function App() {
         </aside>
 
         <main className="app__main">
-          <RunPanel
-            caseId={selectedCase}
-            backend={backend}
-            onBackendChange={setBackend}
-            status={status}
-            onRun={handleRun}
-            onStop={handleStop}
-            stepCount={steps.length}
-            elapsedMs={elapsedMs}
-          />
+          <ErrorBoundary
+            resetKey={selectedCase}
+            fallback={(err, reset) => (
+              <div className="app__error app__error--fatal" role="alert">
+                <h2>Panel render failed · 面板渲染异常</h2>
+                <p>{err.message}</p>
+                <button type="button" onClick={reset}>
+                  Retry · 重试
+                </button>
+              </div>
+            )}
+          >
+            <RunPanel
+              caseId={selectedCase}
+              backend={backend}
+              onBackendChange={setBackend}
+              status={status}
+              onRun={handleRun}
+              onStop={handleStop}
+              stepCount={steps.length}
+              elapsedMs={elapsedMs}
+            />
 
-          {error && <div className="app__error">⚠ {error}</div>}
+            {error && <div className="app__error">⚠ {error}</div>}
 
-          <TraceTimeline steps={steps} running={status === "running"} />
+            <TraceTimeline steps={steps} running={status === "running"} />
 
-          {report && <ReportCard report={report} />}
+            {report && <ReportCard report={report} />}
+          </ErrorBoundary>
         </main>
       </div>
     </div>
