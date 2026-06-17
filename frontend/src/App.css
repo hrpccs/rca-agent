@@ -83,6 +83,170 @@
   font-size: 13px;
 }
 
+/* Banners: disconnect recovery (amber) and replay (blue). */
+.app__banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.app__banner--disconnect {
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: #fde68a;
+}
+.app__banner--replay {
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  color: #bfdbfe;
+}
+.app__banner code {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.app__banner-action {
+  margin-left: auto;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.app__banner-action:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* Sidebar secondary section (RunHistory lives below CasePicker). */
+.app__sidebar-section {
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+  max-height: 40%;
+  overflow-y: auto;
+}
+
+/* ---------- RunHistory ---------- */
+.run-history {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 8px;
+}
+.run-history__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 6px 8px;
+}
+.run-history__title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-mute);
+}
+.run-history__count {
+  font-size: 11px;
+  color: var(--text-mute);
+  font-family: var(--mono);
+}
+.run-history__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.run-history__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.run-history__item:hover {
+  background: var(--bg-elev-2);
+  color: var(--text);
+}
+.run-history__item--active {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: rgba(59, 130, 246, 0.5);
+  color: var(--accent-2);
+}
+.run-history__status {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  text-transform: uppercase;
+  flex: 0 0 auto;
+}
+.run-history__status--completed {
+  color: var(--green);
+  border-color: rgba(34, 197, 94, 0.4);
+}
+.run-history__status--error {
+  color: var(--red);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+.run-history__status--running {
+  color: var(--amber);
+  border-color: rgba(245, 158, 11, 0.4);
+}
+.run-history__meta {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.run-history__time {
+  font-size: 11px;
+  color: var(--text-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.run-history__steps {
+  font-size: 10px;
+  color: var(--text-mute);
+  font-family: var(--mono);
+}
+.run-history__id {
+  font-size: 10px;
+  color: var(--text-mute);
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.run-history__badge {
+  font-size: 10px;
+  color: var(--accent-2);
+  font-family: var(--mono);
+}
+.run-history__empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-mute);
+}
+
+/* Replay badge in TraceTimeline header. */
+.timeline__replay {
+  color: var(--accent-2);
+}
+
 /* ---------- CasePicker ---------- */
 .case-picker {
   display: flex;

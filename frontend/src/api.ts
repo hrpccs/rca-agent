@@ -3,6 +3,8 @@ import type {
   CasesResponse,
   RcaReport,
   RcaStep,
+  Run,
+  RunSummary,
   StartRcaResponse,
   SseDelta,
   SseEvent,
@@ -33,7 +35,7 @@ export async function fetchCases(): Promise<string[]> {
   return body.cases ?? [];
 }
 
-/** Start (or re-fetch) an RCA run, returning the SSE stream URL. */
+/** Start (or re-fetch) an RCA run, returning the SSE stream URL (+ run_id). */
 export async function startRca(caseId: string, backend: Backend = "parquet"): Promise<StartRcaResponse> {
   const res = await fetch(withBase(`/rca/${encodeURIComponent(caseId)}?backend=${backend}`), {
     method: "POST",
@@ -43,6 +45,59 @@ export async function startRca(caseId: string, backend: Backend = "parquet"): Pr
     throw new Error(`startRca failed: ${res.status} ${res.statusText} ${text}`);
   }
   return (await res.json()) as StartRcaResponse;
+}
+
+/**
+ * List persisted runs. Pass a `caseId` to filter to one case
+ * (`GET /runs?case_id=…`); omit it for the global list. Returns the `runs`
+ * array (never null) so callers can `.map` without a guard.
+ *
+ * Envelope shape: `{ runs: RunSummary[] }`.
+ */
+export async function fetchRuns(caseId?: string | null): Promise<RunSummary[]> {
+  const path =
+    caseId != null && caseId !== ""
+      ? `/runs?case_id=${encodeURIComponent(caseId)}`
+      : "/runs";
+  const res = await fetch(withBase(path));
+  if (!res.ok) {
+    throw new Error(`fetchRuns failed: ${res.status} ${res.statusText}`);
+  }
+  const body = (await res.json()) as { runs?: RunSummary[] };
+  return body.runs ?? [];
+}
+
+/**
+ * Fetch a single persisted run with its steps. The backend returns
+ * `{ run: RunSummary, steps: RcaStep[], report?: RcaReport }`; we merge the
+ * three into a {@link Run} so callers get one typed object. Steps default to
+ * `[]` when absent; `report` is forwarded when the backend includes it.
+ */
+export async function fetchRun(runId: string): Promise<Run> {
+  const res = await fetch(withBase(`/runs/${encodeURIComponent(runId)}`));
+  if (!res.ok) {
+    throw new Error(`fetchRun failed: ${res.status} ${res.statusText}`);
+  }
+  const body = (await res.json()) as {
+    run: RunSummary;
+    steps?: RcaStep[];
+    report?: RcaReport | null;
+  };
+  return {
+    ...body.run,
+    steps: body.steps ?? [],
+    ...(body.report !== undefined ? { report: body.report } : {}),
+  };
+}
+
+/** Fetch only the persisted steps for a run (`GET /runs/{runId}/steps`). */
+export async function fetchRunSteps(runId: string): Promise<RcaStep[]> {
+  const res = await fetch(withBase(`/runs/${encodeURIComponent(runId)}/steps`));
+  if (!res.ok) {
+    throw new Error(`fetchRunSteps failed: ${res.status} ${res.statusText}`);
+  }
+  const body = (await res.json()) as { steps?: RcaStep[] };
+  return body.steps ?? [];
 }
 
 /** Callbacks invoked as SSE events are parsed from the stream. */
@@ -66,6 +121,27 @@ export interface OpenStreamOptions {
    * Default: 60000 (60s).
    */
   idleTimeoutMs?: number;
+  /**
+   * Optional run id to thread onto the stream URL
+   * (`…&run_id=…`). When the backend persisted a run for this invocation, pass
+   * its id so the server can correlate the live SSE stream with the stored run
+   * row (and so the client knows which run to recover via `fetchRun` if the
+   * transport drops mid-run).
+   */
+  runId?: string | null;
+  /**
+   * Resilience hook: invoked ONCE, with the runId (if known), when the SSE
+   * *transport* fails mid-run (native `error` event while the readyState is
+   * CLOSED) — as opposed to an idle-timeout, a clean `done`, or a server-sent
+   * `error` event. This is the distinct signal that "the connection itself
+   * died and there may be a persisted trace worth fetching." Use it to
+   * best-effort load the persisted trace via {@link fetchRun}; note that
+   * `onError` ALSO fires with the `stream closed for case …` message, so this
+   * callback is purely an extra *channel* to distinguish a transport drop from
+   * a hard server error. If `runId` was not supplied, the argument is null and
+   * the caller should fall back to the in-memory partial trace.
+   */
+  onTransportClosed?: (runId: string | null) => void;
 }
 
 /**
@@ -128,8 +204,14 @@ export function openRcaStream(
 ): RcaStreamHandle {
   const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   const armIdle = shouldArmIdle(idleTimeoutMs);
+  const runId = options.runId ?? null;
 
-  const url = withBase(`/rca/${encodeURIComponent(caseId)}/stream?backend=${backend}`);
+  // Build the stream URL. `run_id` is threaded through as a query param so the
+  // backend can correlate this SSE stream with its persisted run row (the
+  // sibling backend unit uses it to attach emitted steps to the right run).
+  // Omitted entirely when no runId is known (older backends).
+  const qs = `backend=${backend}${runId ? `&run_id=${encodeURIComponent(runId)}` : ""}`;
+  const url = withBase(`/rca/${encodeURIComponent(caseId)}/stream?${qs}`);
   const es = new EventSource(url);
 
   // --- Idle watchdog state -------------------------------------------------
@@ -260,6 +342,10 @@ export function openRcaStream(
   // fires `error` and auto-retries while CONNECTING, then ends in CLOSED.
   // Surface once when the connection has truly failed (CLOSED) so callers can
   // stop the run instead of waiting on retries that will never deliver data.
+  // We ALSO fire `onTransportClosed` (once) with the known runId so the caller
+  // can best-effort recover the persisted trace — this is distinct from the
+  // idle-timeout, a clean `done`, and a server-sent `error` event, none of
+  // which reach this CLOSED branch.
   let nativeErrorSurfaced = false;
   es.onerror = () => {
     if (nativeErrorSurfaced) return;
@@ -272,7 +358,19 @@ export function openRcaStream(
     }
     if (es.readyState === EventSource.CLOSED) {
       nativeErrorSurfaced = true;
+      // Teardown FIRST so neither user callback can leave the EventSource
+      // open (matching the listener contract: disposeInternal runs before the
+      // user-facing terminal callback is invoked). Then fire BOTH callbacks
+      // independently — one throwing must not suppress the other, since they
+      // carry distinct signals (onTransportClosed => "try to fetch the
+      // persisted trace"; onError => "show the error banner").
       disposeInternal(/* transport */);
+      try {
+        options.onTransportClosed?.(runId);
+      } catch {
+        // Swallow only here: onError below must still fire even if the
+        // resilience hook throws. The hook is best-effort by design.
+      }
       handlers.onError?.(`stream closed for case ${caseId}`, {
         event: "error",
         case_id: caseId,
