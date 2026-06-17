@@ -335,7 +335,7 @@ class TestTraceCmd:
         rc = cli._cmd_trace(self._args(bad_id))
         assert rc == 2
         err = capsys.readouterr().err
-        assert "valid report id" in err
+        assert "valid run/report id" in err
 
 
 # --------------------------------------------------------------------------- #
@@ -469,3 +469,200 @@ class TestEnvInt:
         monkeypatch.setenv("RCA_RUNS_LIMIT", "oops")
         args = cli.build_parser().parse_args(["runs"])
         assert args.limit == 50
+
+
+# --------------------------------------------------------------------------- #
+# Wave-4 trace-store path (list_runs / get_run / list_steps)
+# --------------------------------------------------------------------------- #
+class _FakeTraceStore:
+    """Stand-in exposing the Wave-4 trace-store API used by the repointed CLI.
+
+    Also implements ``get_report`` so the ``trace`` fallback path (run_id not
+    found -> report_id lookup) can be exercised.
+    """
+
+    def __init__(
+        self,
+        *,
+        runs: list[dict[str, Any]] | None = None,
+        steps_by_run: dict[str, list] | None = None,
+        report_by_id: dict[str, Any] | None = None,
+        raise_on_list_runs: bool = False,
+        raise_on_get_run: bool = False,
+    ) -> None:
+        self._runs = runs if runs is not None else []
+        self._steps = steps_by_run or {}
+        self._report_by_id = report_by_id or {}
+        self._raise_on_list_runs = raise_on_list_runs
+        self._raise_on_get_run = raise_on_get_run
+
+    def list_runs(self, case_id: str | None = None, limit: int = 50) -> list[dict]:
+        if self._raise_on_list_runs:
+            from rca_agent.store.mysql_store import StoreError
+
+            raise StoreError("list_runs boom")
+        rows = self._runs
+        if case_id is not None:
+            rows = [r for r in rows if r.get("case_id") == case_id]
+        return rows[:limit]
+
+    def get_run(self, run_id: str) -> dict | None:
+        if self._raise_on_get_run:
+            from rca_agent.store.mysql_store import StoreError
+
+            raise StoreError("get_run boom")
+        return next((r for r in self._runs if r.get("run_id") == run_id), None)
+
+    def list_steps(self, run_id: str, limit: int = 20000) -> list:
+        return list(self._steps.get(run_id, []))[:limit]
+
+    def get_report(self, report_id: str):  # noqa: ANN201
+        return self._report_by_id.get(report_id)
+
+
+class TestRunsTraceStorePath:
+    """The repointed path: ``runs``/``trace`` read the Wave-4 trace store."""
+
+    _RUN_ID = "0192f8c1a4b748e29a8f1c2d3b4e5f60"
+    _RUN_ID2 = "deadbeef" * 4
+
+    def test_runs_renders_run_summaries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        runs = [
+            {
+                "run_id": self._RUN_ID, "case_id": "t001", "status": "completed",
+                "model": "deepseek-reasoner", "step_count": 18,
+                "started_at": None, "finished_at": None, "token_usage": None,
+            },
+            {
+                "run_id": self._RUN_ID2, "case_id": "t002", "status": "error",
+                "model": None, "step_count": 3,
+                "started_at": None, "finished_at": None, "token_usage": None,
+            },
+        ]
+        _patch_store(monkeypatch, _FakeTraceStore(runs=runs))
+        rc = cli._cmd_runs(argparse.Namespace(case=None, limit=50))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "2 run(s):" in out
+        # run_id prefix, status (incl. an ERRORED run that list_reports would miss),
+        # and step_count all render.
+        assert "run=0192f8c1a4b7" in out
+        assert "case=t001" in out and "status=completed" in out and "steps=18" in out
+        assert "case=t002" in out and "status=error" in out
+        assert "trace <run_id>" in out
+
+    def test_runs_case_filter_passed_to_list_runs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        seen: dict[str, Any] = {}
+        store = _FakeTraceStore(
+            runs=[{"run_id": "a" * 32, "case_id": "t001", "status": "completed", "step_count": 1}]
+        )
+        orig = store.list_runs
+
+        def spy(case_id=None, limit=50):  # noqa: ANN001
+            seen["case_id"] = case_id
+            seen["limit"] = limit
+            return orig(case_id=case_id, limit=limit)
+
+        store.list_runs = spy  # type: ignore[method-assign]
+        _patch_store(monkeypatch, store)
+        rc = cli._cmd_runs(argparse.Namespace(case="t001", limit=7))
+        assert rc == 0
+        assert seen == {"case_id": "t001", "limit": 7}
+
+    def test_runs_empty_friendly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _patch_store(monkeypatch, _FakeTraceStore(runs=[]))
+        rc = cli._cmd_runs(argparse.Namespace(case=None, limit=50))
+        assert rc == 0
+        assert "no runs found" in capsys.readouterr().out
+
+    def test_runs_store_error_nonzero(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _patch_store(monkeypatch, _FakeTraceStore(raise_on_list_runs=True))
+        rc = cli._cmd_runs(argparse.Namespace(case=None, limit=50))
+        assert rc == 1
+        assert "error" in capsys.readouterr().err
+
+    def test_trace_from_summary_and_steps(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        steps = [
+            _step(StepKind.REASONING, step_id="s1", thought="spike in checkout errors"),
+            _step(StepKind.CONCLUDE, step_id="s2", hypothesis="slow inventory DB", confidence=0.82),
+        ]
+        runs = [
+            {
+                "run_id": self._RUN_ID, "case_id": "t001", "status": "completed",
+                "model": "deepseek-reasoner", "step_count": 2,
+                "started_at": None, "finished_at": None, "token_usage": {"total": 99},
+            }
+        ]
+        _patch_store(
+            monkeypatch,
+            _FakeTraceStore(runs=runs, steps_by_run={self._RUN_ID: steps}),
+        )
+        rc = cli._cmd_trace(argparse.Namespace(report_id=self._RUN_ID))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "=== trace" in out and "case=t001" in out
+        assert "status=completed" in out and "steps=2" in out
+        assert "TOKENS:" in out
+        # The terminal conclude step is rendered as the root cause.
+        assert "ROOT CAUSE: slow inventory DB" in out
+        assert "CONFIDENCE: 0.82" in out
+
+    def test_trace_unknown_run_no_report(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # get_run -> None, get_report -> None => no such run.
+        _patch_store(monkeypatch, _FakeTraceStore(runs=[]))
+        rc = cli._cmd_trace(argparse.Namespace(report_id=self._RUN_ID))
+        assert rc == 1
+        assert "no such run" in capsys.readouterr().err
+
+    def test_trace_falls_back_to_report(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # run_id not in rca_runs, but report_id present in rca_reports (run -o / eval).
+        report = _report([_step(StepKind.CONCLUDE, step_id="s1", hypothesis="rc", confidence=0.5)])
+        _patch_store(
+            monkeypatch,
+            _FakeTraceStore(runs=[], report_by_id={self._RUN_ID: report}),
+        )
+        rc = cli._cmd_trace(argparse.Namespace(report_id=self._RUN_ID))
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The report-fallback path ran: it prints the report's root_cause.summary
+        # and FAULT TYPE (which the trace-summary path does not).
+        assert "=== trace" in out
+        assert "ROOT CAUSE:" in out
+        assert "FAULT TYPE: db.slow_query" in out
+
+    def test_trace_get_run_store_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _patch_store(monkeypatch, _FakeTraceStore(raise_on_get_run=True))
+        rc = cli._cmd_trace(argparse.Namespace(report_id=self._RUN_ID))
+        assert rc == 1
+        assert "error" in capsys.readouterr().err

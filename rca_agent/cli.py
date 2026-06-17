@@ -3,8 +3,8 @@
 Subcommands:
   cases                 list available benchmark cases
   run <case>            run the RCA agent on a case (parquet|clickhouse backend)
-  runs                  list persisted RCA reports (the durable run + step trace)
-  trace <report_id>     print one report's full ordered step trace
+  runs                  list persisted RCA runs (the durable run + step trace)
+  trace <run_id>        print one run's full ordered step trace
   llm ping              one real DeepSeek call (verifies thinking mode)
   data <case> <mod>     dump a sample of one data modality for a case
   import-case <case>    import a case into ClickHouse
@@ -358,18 +358,33 @@ def _new_store():
     return MysqlStore()
 
 
-def _cmd_runs(args: argparse.Namespace) -> int:
-    """List persisted RCA reports (the durable per-case run + step trace).
+def _fmt_dt(v: object) -> str:
+    """Render a datetime/str/None timestamp compactly for CLI output."""
+    if v is None:
+        return "-"
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
 
-    Today a persisted run == one ``rca_reports`` row (its ``steps_json`` carries
-    the full ordered ``RcaStep`` list). ``--case`` filters, ``--limit`` caps the
-    page (default 50, matching ``list_reports``). The table is human-readable;
-    errors surface as a clear stderr message + non-zero exit, never a traceback.
+
+def _cmd_runs(args: argparse.Namespace) -> int:
+    """List persisted RCA runs (the durable per-case run + step trace).
+
+    Prefers the Wave-4 trace store (``rca_runs`` + per-run ``step_count``),
+    which lists EVERY run — including ones that errored or were truncated, not
+    just successful ones — and exposes the ``run_id`` that ``trace`` consumes.
+    When the trace API is unavailable (e.g. an older store), falls back to
+    ``list_reports`` so the CLI always works. ``--case`` filters, ``--limit``
+    caps the page (default 50). Errors surface as a clear stderr message +
+    non-zero exit, never a traceback.
     """
     from .store.mysql_store import StoreError
 
     try:
         store = _new_store()
+        if hasattr(store, "list_runs"):
+            runs = store.list_runs(case_id=args.case, limit=args.limit)
+            return _render_runs_summaries(runs, args)
         reports = store.list_reports(case_id=args.case, limit=args.limit)
     except StoreError as exc:
         print(f"error: could not list runs: {exc}", file=sys.stderr)
@@ -379,16 +394,15 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         print(f"error: could not list runs: {exc}", file=sys.stderr)
         return 1
 
+    # Report-fallback path (no trace store): a persisted run here is one
+    # rca_reports row. RcaReport carries no report_id, so we can't offer a
+    # traceable id in this view — use the server / the /runs API for that.
     if not reports:
         where = f" for case {args.case}" if args.case else ""
         print(f"no runs found{where}.", flush=True)
         return 0
 
     print(f"{len(reports)} run(s):", flush=True)
-    # Today a persisted run's stable key is its case_id (the server's
-    # ``/reports/{case_id}`` returns the most recent report for a case). The
-    # ``trace`` subcommand takes a 32-char hex report_id; use ``trace`` on the
-    # id logged by the server's report-persist path, or re-run via ``run -o``.
     for r in reports:
         cid = getattr(r, "case_id", "?")
         status = getattr(r, "status", "?")
@@ -396,33 +410,75 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         steps = len(getattr(r, "steps", []) or [])
         print(f"  case={cid}  status={status}  model={model}  steps={steps}", flush=True)
     print(
-        "\n(tip: `rca-agent trace <report_id>` prints a run's full step trace; "
-        "get a report_id from the server's report-persist log or `run -o`.)",
+        "\n(tip: report-backed runs have no run_id here; use the server "
+        "(`POST /rca`) or the `/runs` API for run_id-based traces.)",
         flush=True,
     )
     return 0
 
 
-def _cmd_trace(args: argparse.Namespace) -> int:
-    """Print one report's full ordered step trace.
+def _render_runs_summaries(runs: list, args: argparse.Namespace) -> int:
+    """Render ``list_runs`` summary dicts (the Wave-4 trace-store path)."""
+    if not runs:
+        where = f" for case {args.case}" if args.case else ""
+        print(f"no runs found{where}.", flush=True)
+        return 0
+    print(f"{len(runs)} run(s):", flush=True)
+    for d in runs:
+        rid = str(d.get("run_id") or "?")
+        cid = str(d.get("case_id") or "?")
+        status = str(d.get("status") or "?")
+        model = str(d.get("model") or "-")
+        steps = int(d.get("step_count") or 0)
+        line = (
+            f"  run={rid[:12]}  case={cid}  status={status}  model={model}  steps={steps}"
+        )
+        if d.get("started_at"):
+            line += f"  started={_fmt_dt(d['started_at'])}"
+        print(line, flush=True)
+    print(
+        "\n(tip: `rca-agent trace <run_id>` prints a run's full step trace.)",
+        flush=True,
+    )
+    return 0
 
-    ``report_id`` must be a 32-char hex uuid (the id returned by ``runs`` /
-    ``save_report``). Prints the run header then each ``RcaStep`` in order via
-    the shared ``_print_step`` renderer. Unknown id / store error / bad id all
-    surface as a clear stderr message + non-zero exit, never a traceback.
+
+def _kind_of(step: object) -> str:
+    """Best-effort step_kind string for a persisted/live step."""
+    k = getattr(step, "step_kind", None)
+    return k.value if hasattr(k, "value") else str(k)
+
+
+def _cmd_trace(args: argparse.Namespace) -> int:
+    """Print one run's full ordered step trace.
+
+    The positional id may be a ``run_id`` (Wave-4 trace store: ``rca_steps``)
+    OR a ``report_id`` (``rca_reports``, e.g. produced by ``run -o`` / eval) —
+    both are 32-char hex uuids. The trace store is tried first (it covers
+    server runs, including ones that errored or were truncated and never
+    produced a report); if the id isn't a known run, we fall back to the report
+    lookup. Unknown id / store error / bad id all surface as a clear stderr
+    message + non-zero exit, never a traceback.
     """
     from .store.mysql_store import StoreError
 
     rid = args.report_id
     if not _REPORT_ID_RE.match(rid):
         print(
-            f"error: '{rid}' is not a valid report id (expected 32-char hex uuid)",
+            f"error: '{rid}' is not a valid run/report id (expected 32-char hex uuid)",
             file=sys.stderr,
         )
         return 2
 
     try:
         store = _new_store()
+        # Trace-store path: run_id -> rca_steps.
+        if hasattr(store, "get_run"):
+            summary = store.get_run(rid)
+            if summary is not None:
+                steps = store.list_steps(rid) if hasattr(store, "list_steps") else []
+                return _render_trace_from_summary(rid, summary, steps)
+        # Report path: report_id -> rca_reports (covers `run -o` / eval runs).
         report = store.get_report(rid)
     except StoreError as exc:
         print(f"error: could not read run {rid}: {exc}", file=sys.stderr)
@@ -455,6 +511,37 @@ def _cmd_trace(args: argparse.Namespace) -> int:
     return 0
 
 
+def _render_trace_from_summary(rid: str, summary: dict, steps: list) -> int:
+    """Render a run from its trace-store summary + persisted ``RcaStep`` rows.
+
+    The terminal root cause lives in the final ``conclude`` step of the trace
+    (it carries ``hypothesis`` + ``confidence``), so no report lookup is needed.
+    """
+    cid = str(summary.get("case_id") or "?")
+    status = str(summary.get("status") or "?")
+    model = str(summary.get("model") or "-")
+    print(f"=== trace {rid} :: case={cid} ===", flush=True)
+    head = f"status={status}  model={model}  steps={len(steps)}"
+    if summary.get("started_at"):
+        head += f"  started={_fmt_dt(summary['started_at'])}"
+    if summary.get("finished_at"):
+        head += f"  finished={_fmt_dt(summary['finished_at'])}"
+    print(head, flush=True)
+    if summary.get("token_usage"):
+        print(f"TOKENS: {summary['token_usage']}", flush=True)
+    for i, step in enumerate(steps):
+        _print_trace_step(i + 1, step)
+    conclude = next((s for s in reversed(steps) if _kind_of(s) == "conclude"), None)
+    if conclude is not None:
+        print("\n" + "=" * 70, flush=True)
+        hyp = getattr(conclude, "hypothesis", None) or "(no hypothesis)"
+        print(f"ROOT CAUSE: {hyp}", flush=True)
+        conf = getattr(conclude, "confidence", None)
+        if conf is not None:
+            print(f"CONFIDENCE: {conf}", flush=True)
+    return 0
+
+
 def _env_int(name: str, default: int) -> int:
     """Read an int env var, falling back to ``default`` on missing/bad values.
 
@@ -479,7 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("cases", help="list benchmark cases").set_defaults(func=_cmd_cases)
 
-    pruns = sub.add_parser("runs", help="list persisted RCA runs (reports)")
+    pruns = sub.add_parser("runs", help="list persisted RCA runs")
     pruns.add_argument("--case", default=None, help="filter by case_id")
     pruns.add_argument(
         "--limit",
@@ -490,7 +577,9 @@ def build_parser() -> argparse.ArgumentParser:
     pruns.set_defaults(func=_cmd_runs)
 
     ptrace = sub.add_parser("trace", help="print a run's full ordered step trace")
-    ptrace.add_argument("report_id", help="32-char hex report/run id (see `runs`)")
+    ptrace.add_argument(
+        "report_id", metavar="run_id", help="32-char hex run_id (or report_id); see `runs`"
+    )
     ptrace.set_defaults(func=_cmd_trace)
 
     pr = sub.add_parser("run", help="run the RCA agent on a case")
