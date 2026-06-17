@@ -273,7 +273,7 @@ def build_agent_for_case(
     if backend == "clickhouse":
         from ..providers.clickhouse_provider import ClickhouseProvider
 
-        provider = ClickhouseProvider(case_id)
+        provider = ClickhouseProvider(case_id, window=case.task.alert_window)
     else:
         from ..providers.parquet_provider import ParquetProvider
 

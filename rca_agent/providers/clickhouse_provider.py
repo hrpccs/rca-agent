@@ -126,8 +126,18 @@ def _in_clause(values: list[str] | None) -> tuple[str | None, list[str]]:
 class ClickhouseProvider:
     """Production :class:`DataProvider` backed by ClickHouse (db ``rca``)."""
 
-    def __init__(self, case_id: str, dsn: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        case_id: str,
+        dsn: dict[str, Any] | None = None,
+        window: TimeWindow | None = None,
+    ) -> None:
         self.case_id = case_id
+        # The investigation tools read `provider.window` (the case alert window)
+        # to scope every query by default. ParquetProvider sets this from the
+        # Case; mirror it here so the ClickHouse backend isn't blind to time.
+        # Optional — standalone/schema-only construction leaves it unset.
+        self.window: TimeWindow | None = window
         cfg = dsn if dsn is not None else get_settings().clickhouse_dsn()
         # clickhouse_connect uses port 8123 (HTTP) by default; the dsn from
         # settings already carries the configured port.
