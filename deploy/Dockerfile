@@ -18,6 +18,11 @@ RUN uv sync --frozen --no-dev
 COPY rca_agent ./rca_agent
 COPY memory ./memory
 
+# Run the server as a non-root user.
+RUN groupadd --system app && useradd --system --gid app --home-dir /app app \
+ && chown -R app:app /app
+USER app
+
 EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)" || exit 1
