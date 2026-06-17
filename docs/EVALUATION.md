@@ -229,3 +229,55 @@ set -a; . .env; set +a; unset all_proxy ALL_PROXY http_proxy HTTP_PROXY https_pr
 uv run python -m rca_agent.cli eval --cases t001,t002,t004,t020,t040,t060,t080,t100 --backend parquet
 uv run python scripts/analyze_eval.py --runs-dir runs
 ```
+
+> **Note:** `t001`'s data has since moved under `cases/t001/t001_backup/`, so
+> `load_case("t001")` now raises `FileNotFoundError`. `list_cases()` returns the
+> **102** cases that still have a top-level `task.json` (t002–t103); use those
+> for accrual.
+
+---
+
+## 6. Post-improvement validation (I1–I4)
+
+Four improvements were implemented from the §4 recommendations and re-measured
+on a 7-case re-run of the same set (`runs_post/`; `t001` skipped per the note
+above). `eval_baselines/baseline-2026-06-18-post.json` is the post-improvement
+snapshot; the pre-improvement `baseline-2026-06-18.json` is retained for the
+historical comparison.
+
+**Validated wins:**
+
+- **I1 — token accounting (FIXED, confirmed).** `reasoning_tokens` is now
+  captured (avg **3,698/case**) vs **0 in 8/8** pre-improvement. The
+  thinking-cost budget is no longer invisible. (`0/7` cases now report zero.)
+- **I2 — force-conclude fallback (WORKS, confirmed on the failure case).** The
+  pre-improvement `t080` truncated to **confidence 0.0 / no answer** after 768K
+  tokens. Post-improvement `t080` still reaches the step cap (`status=truncated`)
+  but **recovers a real root cause at confidence 0.55** ("inventory endpoint
+  traffic dropped 53%, self-recovered; likely upstream cart reduced calls —
+  transient"). Exactly the intended rescue: a full-cost run no longer returns
+  nothing.
+- **I3 — per-module cost/latency + eval flags (used here).** The `--out-dir`
+  flag produced this very `runs_post/` comparison without disturbing `runs/`;
+  `eval_summary` now carries per-tool latency + modality breakdown +
+  `tool_call_p90`.
+- **I4 — context bounding (opt-in, default OFF).** Available via
+  `RCA_CONTEXT_TOOL_RESULT_MAX_CHARS` / `RCA_CONTEXT_MAX_TOOL_MESSAGES`; not
+  exercised live yet (default-off preserves behavior; unit-tested).
+
+**Caveat — single-seed noise (a new infra finding).** The aggregate before/after
+is **not** a clean signal: `t060` swung 0.78→0.30 (confidence) on a single
+re-run, and the baseline-diff tool flagged `convergence_rate`/`avg_confidence`
+"regressions" that are **DeepSeek non-determinism + the missing t001**, not
+real effects. I2 only touches the truncated path and I4 is off by default, so
+they cannot explain a completed-case confidence drop. **Implication: the eval
+must run multiple seeds per case and report mean±std** before any
+improvement-attribution or regression-gating is trustworthy. This raises the
+priority of a **multi-seed / repeated-runs** mode (add to §4 as P1): `--seeds N`
+in the runner, accrue N runs/case, and have the analyzer report per-case
+variance + a noise-aware diff.
+
+**Continuous evaluation (E4):** a paced accrual loop runs ~2 new cases per
+~30 min against the 102 valid cases, appending to `runs/` and re-running the
+analyzer + post-improvement baseline diff. It auto-expires after 7 days and
+stops accruing past a coverage target (~50 cases) to bound cost.

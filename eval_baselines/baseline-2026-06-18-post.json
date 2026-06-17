@@ -1,0 +1,93 @@
+{
+  "metadata": {
+    "date": "2026-06-18",
+    "label": "post-improvement (I1 token-fix + I2 force-conclude)",
+    "model": "deepseek-reasoner",
+    "reasoning_effort": "high",
+    "backend": "parquet",
+    "git_sha": "99476f3",
+    "note": "7-case re-run of the baseline set post I1-I4. t001 skipped (data moved to t001_backup/). Single-seed -> noisy (see EVALUATION.md)."
+  },
+  "aggregate": {
+    "n_cases": 7,
+    "n_completed": 6,
+    "n_truncated": 1,
+    "avg_confidence": 0.74,
+    "avg_steps": 81.17,
+    "avg_tool_calls": 33,
+    "avg_total_tokens": 474597.83,
+    "avg_reasoning_tokens": 3698.33
+  },
+  "per_case": [
+    {
+      "case_id": "t002",
+      "status": "completed",
+      "confidence": 0.85,
+      "fault_type": "dependency.timeout",
+      "n_steps": 71,
+      "n_tool_calls": 29,
+      "total_tokens": 352215,
+      "reasoning_tokens": 2265
+    },
+    {
+      "case_id": "t004",
+      "status": "completed",
+      "confidence": 0.72,
+      "fault_type": "dependency.timeout",
+      "n_steps": 77,
+      "n_tool_calls": 31,
+      "total_tokens": 686532,
+      "reasoning_tokens": 5115
+    },
+    {
+      "case_id": "t020",
+      "status": "completed",
+      "confidence": 0.85,
+      "fault_type": "infra.dependency_unavailable",
+      "n_steps": 111,
+      "n_tool_calls": 45,
+      "total_tokens": 712176,
+      "reasoning_tokens": 3810
+    },
+    {
+      "case_id": "t040",
+      "status": "completed",
+      "confidence": 0.85,
+      "fault_type": "infra.database_slow_query",
+      "n_steps": 72,
+      "n_tool_calls": 30,
+      "total_tokens": 272648,
+      "reasoning_tokens": 3375
+    },
+    {
+      "case_id": "t060",
+      "status": "completed",
+      "confidence": 0.3,
+      "fault_type": null,
+      "n_steps": 85,
+      "n_tool_calls": 35,
+      "total_tokens": 354079,
+      "reasoning_tokens": 5318
+    },
+    {
+      "case_id": "t080",
+      "status": "truncated",
+      "confidence": 0.55,
+      "fault_type": "transient.traffic_fluctuation",
+      "n_steps": 115,
+      "n_tool_calls": 44,
+      "total_tokens": 930353,
+      "reasoning_tokens": 3935
+    },
+    {
+      "case_id": "t100",
+      "status": "completed",
+      "confidence": 0.85,
+      "fault_type": "dependency.timeout",
+      "n_steps": 71,
+      "n_tool_calls": 28,
+      "total_tokens": 469937,
+      "reasoning_tokens": 2307
+    }
+  ]
+}
