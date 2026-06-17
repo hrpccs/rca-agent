@@ -76,11 +76,16 @@ def _install_route(
 
 
 def _usage(**kw: int) -> dict[str, Any]:
-    """The SDK's CompletionUsage.model_dump() always includes the *_details keys."""
+    """The SDK's CompletionUsage.model_dump() always includes the *_details keys.
+
+    After I1, the client normalizes the usage dict before emitting it, so the
+    expected shape also carries a top-level ``reasoning_tokens`` (0 unless the
+    caller overrides it or the nested completion_tokens_details provides it)."""
     base = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     base.update(kw)
     base.setdefault("completion_tokens_details", None)
     base.setdefault("prompt_tokens_details", None)
+    base.setdefault("reasoning_tokens", 0)
     return base
 
 
@@ -533,6 +538,152 @@ async def test_complete_omits_tools_when_none(base_url: str) -> None:
     sent = json.loads(route.calls[0].request.content)
     assert "tools" not in sent
     assert "tool_choice" not in sent
+
+
+# --------------------------------------------------------------------------- #
+# Usage normalization (I1: reasoning-token accounting fix)
+# --------------------------------------------------------------------------- #
+def test_normalize_usage_hoists_nested_reasoning_tokens() -> None:
+    """DeepSeek-reasoner nests thinking tokens under
+    completion_tokens_details.reasoning_tokens; the normalized dict must expose
+    them at top-level reasoning_tokens so core.py _accum_usage can see them."""
+    from rca_agent.llm.deepseek_client import _normalize_usage
+
+    raw = {
+        "prompt_tokens": 1000,
+        "completion_tokens": 500,
+        "total_tokens": 1500,
+        "completion_tokens_details": {"reasoning_tokens": 9000},
+        "prompt_tokens_details": None,
+    }
+    out = _normalize_usage(raw)
+    assert out["reasoning_tokens"] == 9000
+    assert out["prompt_tokens"] == 1000
+    assert out["completion_tokens"] == 500
+    assert out["total_tokens"] == 1500
+    # Nested details preserved untouched.
+    assert out["completion_tokens_details"] == {"reasoning_tokens": 9000}
+
+
+def test_normalize_usage_computes_total_when_absent() -> None:
+    """Some providers omit total_tokens; the helper must compute prompt+completion."""
+    from rca_agent.llm.deepseek_client import _normalize_usage
+
+    out = _normalize_usage(
+        {
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "completion_tokens_details": {"reasoning_tokens": 9000},
+        }
+    )
+    assert out["total_tokens"] == 1500
+    assert out["reasoning_tokens"] == 9000
+
+
+def test_normalize_usage_flat_dict_passed_through() -> None:
+    """A usage dict that already exposes top-level keys is left unchanged
+    (no spurious hoisting, no re-computation when total_tokens is present)."""
+    from rca_agent.llm.deepseek_client import _normalize_usage
+
+    flat = {
+        "prompt_tokens": 4,
+        "completion_tokens": 3,
+        "total_tokens": 7,
+        "reasoning_tokens": 2,
+    }
+    out = _normalize_usage(flat)
+    assert out == flat
+
+
+def test_normalize_usage_top_level_reasoning_wins_over_nested() -> None:
+    """When BOTH top-level and nested reasoning_tokens are present and non-zero,
+    the top-level value wins (we only hoist when the top-level is missing/0)."""
+    from rca_agent.llm.deepseek_client import _normalize_usage
+
+    out = _normalize_usage(
+        {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+            "reasoning_tokens": 5,
+            "completion_tokens_details": {"reasoning_tokens": 999},
+        }
+    )
+    assert out["reasoning_tokens"] == 5
+
+
+def test_normalize_usage_never_raises_on_garbage() -> None:
+    """Defensive: malformed inputs (None, wrong types, missing nested dicts)
+    must degrade to a zero-filled normalized dict rather than raise."""
+    from rca_agent.llm.deepseek_client import _normalize_usage
+
+    for bad in [None, {}, {"completion_tokens_details": "oops"},
+                {"prompt_tokens": "x", "completion_tokens": None},
+                {"completion_tokens_details": {"reasoning_tokens": "bad"}}]:
+        out = _normalize_usage(bad)
+        # Always exposes the four guaranteed top-level keys as ints.
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"):
+            assert isinstance(out[k], int)
+            assert out[k] >= 0
+
+
+def test_normalize_usage_guards_non_finite_floats() -> None:
+    """A buggy provider emitting float('nan')/float('inf') must not poison the
+    accumulator — _coerce_int falls back to 0 for non-finite floats (int(nan)
+    returns a nan-valued int on CPython that would silently corrupt sums)."""
+    from rca_agent.llm.deepseek_client import _normalize_usage
+
+    out = _normalize_usage(
+        {
+            "prompt_tokens": float("nan"),
+            "completion_tokens": float("inf"),
+            "total_tokens": float("-inf"),
+        }
+    )
+    assert out["prompt_tokens"] == 0
+    assert out["completion_tokens"] == 0
+    assert out["total_tokens"] == 0  # recomputed from 0+0
+    assert out["reasoning_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_usage_chunk_carries_hoisted_reasoning(base_url: str) -> None:
+    """End-to-end: a USAGE delta emitted from a DeepSeek-shaped chunk (nested
+    reasoning_tokens) must reach the caller with top-level reasoning_tokens set.
+
+    This is the actual bug I1 fixes — without _normalize_usage the agent's
+    accumulator reads reasoning_tokens=0 for every thinking-mode call."""
+    body = _sse(
+        [
+            _chunk(reasoning="thinking"),
+            _chunk(content="answer"),
+            _chunk(
+                usage={
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 500,
+                    "total_tokens": 1500,
+                    "completion_tokens_details": {"reasoning_tokens": 9000},
+                    "prompt_tokens_details": None,
+                }
+            ),
+            "[DONE]",
+        ]
+    )
+    client = DeepSeekClient(api_key="sk-test", base_url=base_url)
+    async with respx.mock(base_url=base_url + "/") as mock:
+        _install_route(mock, body)
+        deltas = [d async for d in client.stream(LLMRequest(messages=[{"role": "user", "content": "hi"}]))]
+
+    usages = [d for d in deltas if d.kind is DeltaKind.USAGE]
+    assert len(usages) == 1
+    u = usages[0].usage
+    assert u["reasoning_tokens"] == 9000  # hoisted from completion_tokens_details
+    assert u["total_tokens"] == 1500
+    # Nested details preserved (the SDK may add extra None-valued keys like
+    # accepted_prediction_tokens; only assert the field we care about).
+    ctd = u["completion_tokens_details"]
+    assert isinstance(ctd, dict)
+    assert ctd.get("reasoning_tokens") == 9000
 
 
 # --------------------------------------------------------------------------- #
