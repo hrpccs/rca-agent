@@ -23,15 +23,17 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, ParamSpec, TypeVar
 
 from opentelemetry import metrics, trace
+from opentelemetry.metrics import NoOpMeter
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.trace import Tracer
+from opentelemetry.trace import NoOpTracer, Tracer
 
 from rca_agent.config import get_settings
 
@@ -43,6 +45,8 @@ __all__ = [
     "span",
 ]
 
+logger = logging.getLogger(__name__)
+
 # Module-global provider handles so repeated setup_otel() calls are no-ops and
 # so tests / shutdown can reach them without touching the OTel global API.
 _tracer_provider: TracerProvider | None = None
@@ -52,6 +56,20 @@ _initialized: bool = False
 
 _TRACER_NAME = "rca_agent"
 _METER_NAME = "rca_agent"
+
+# Concrete failures the OTel exporter / SDK construction can raise without
+# indicating a programmer error: a missing optional dependency (ImportError),
+# a malformed endpoint / resource (ValueError/TypeError), or a transport
+# construction failure (OSError). A broad Exception guard remains as the
+# last resort (always logged) since exporter plug-ins can wrap arbitrary I/O.
+_OTEL_NONFATAL_EXC: tuple[type[BaseException], ...] = (
+    ImportError,
+    OSError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    LookupError,
+)
 
 
 def _build_resource(service_name: str) -> Resource:
@@ -124,8 +142,44 @@ def setup_otel(endpoint: str | None = None, service_name: str | None = None) -> 
 
         # ---- LoggerProvider (best-effort; logs API varies by SDK version) ----
         _setup_logger_provider(endpoint, resource)
+    except _OTEL_NONFATAL_EXC as e:
+        # A concrete, expected failure (missing optional dep, malformed
+        # endpoint, transport construction). Degrade to no-op providers so the
+        # process keeps running with the SDK no-ops; log once, structured, so
+        # the misconfiguration is diagnosable.
+        _reset_providers()
+        logger.warning(
+            "otel setup failed (%s); degrading to no-op providers: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "setup_otel",
+                   "error_type": type(e).__name__, "error": str(e),
+                   "endpoint": endpoint},
+        )
+    except Exception as e:  # noqa: BLE001 — last resort: telemetry must never kill setup
+        _reset_providers()
+        logger.warning(
+            "otel setup raised unexpected %s; degrading to no-op providers: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "setup_otel",
+                   "error_type": type(e).__name__, "error": str(e),
+                   "endpoint": endpoint},
+        )
     finally:
         _initialized = True
+
+
+def _reset_providers() -> None:
+    """Clear any partially-constructed providers after a setup failure.
+
+    The OTel global API rejects re-setting an installed provider, but the
+    module globals are what :func:`get_tracer` / :func:`get_meter` prefer, so
+    dropping them here makes the post-failure path fall back to the SDK
+    no-ops cleanly.
+    """
+    global _tracer_provider, _meter_provider, _logger_provider
+    _tracer_provider = None
+    _meter_provider = None
+    _logger_provider = None
 
 
 def _setup_logger_provider(endpoint: str, resource: Any) -> None:
@@ -143,7 +197,22 @@ def _setup_logger_provider(endpoint: str, resource: Any) -> None:
         from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
         from opentelemetry.sdk._logs import LoggerProvider
         from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-    except Exception:  # noqa: BLE001 — best-effort, never fatal
+    except _OTEL_NONFATAL_EXC as e:
+        # Optional log-exporter package missing or renamed — traces/metrics
+        # remain configured. Log once so the gap is visible to operators.
+        logger.warning(
+            "otel logs import failed; logs disabled (traces/metrics unaffected): %s", e,
+            extra={"component": "otel", "phase": "logger_import",
+                   "error_type": type(e).__name__, "error": str(e)},
+        )
+        return
+    except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+        logger.warning(
+            "otel logs import raised unexpected %s; logs disabled: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "logger_import",
+                   "error_type": type(e).__name__, "error": str(e)},
+        )
         return
 
     try:
@@ -153,8 +222,58 @@ def _setup_logger_provider(endpoint: str, resource: Any) -> None:
         )
         set_logger_provider(logger_provider)
         _logger_provider = logger_provider
-    except Exception:  # noqa: BLE001 — best-effort, never fatal
+    except _OTEL_NONFATAL_EXC as e:
+        logger.warning(
+            "otel logger provider construction failed; logs disabled: %s", e,
+            extra={"component": "otel", "phase": "logger_setup",
+                   "error_type": type(e).__name__, "error": str(e),
+                   "endpoint": endpoint},
+        )
         _logger_provider = None
+    except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+        logger.warning(
+            "otel logger provider construction raised unexpected %s; logs disabled: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "logger_setup",
+                   "error_type": type(e).__name__, "error": str(e),
+                   "endpoint": endpoint},
+        )
+        _logger_provider = None
+
+
+def _safe_tracer() -> Tracer:
+    """Return a tracer that is guaranteed never to raise.
+
+    Used as the final fallback in :func:`get_tracer` so the "never raises"
+    contract holds even if the OTel global API itself is in a bad state (a
+    broken provider module referenced via ``OTEL_PYTHON_TRACER_PROVIDER``,
+    or a misconfigured test double). The SDK :class:`~opentelemetry.trace.NoOpTracer`
+    is no-op but fully implements the Tracer interface.
+    """
+    try:
+        return trace.get_tracer(_TRACER_NAME)
+    except Exception as e:  # noqa: BLE001 — absolute last resort
+        logger.warning(
+            "trace.get_tracer fallback raised %s; using NoOpTracer: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "get_tracer_fallback",
+                   "error_type": type(e).__name__, "error": str(e)},
+        )
+        return NoOpTracer()
+
+
+def _safe_meter() -> metrics.Meter:
+    """Return a meter that is guaranteed never to raise (see _safe_tracer)."""
+    try:
+        return metrics.get_meter(_METER_NAME)
+    except Exception as e:  # noqa: BLE001 — absolute last resort
+        logger.warning(
+            "metrics.get_meter fallback raised %s; using NoOpMeter: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "get_meter_fallback",
+                   "error_type": type(e).__name__, "error": str(e)},
+        )
+        return NoOpMeter(_METER_NAME)
 
 
 def get_tracer() -> Tracer:
@@ -163,22 +282,61 @@ def get_tracer() -> Tracer:
     Prefers the module-global provider installed by :func:`setup_otel` so the
     tracer always reflects the most recently configured provider (this also
     lets tests inject an in-memory provider without fighting the OTel global
-    API's "no override" guard).
+    API's "no override" guard). Never raises: any failure degrades to the SDK
+    no-op tracer with a single structured warning.
     """
     if not _initialized:
         setup_otel()
-    if _tracer_provider is not None:
-        return _tracer_provider.get_tracer(_TRACER_NAME)
-    return trace.get_tracer(_TRACER_NAME)
+    try:
+        if _tracer_provider is not None:
+            return _tracer_provider.get_tracer(_TRACER_NAME)
+        return trace.get_tracer(_TRACER_NAME)
+    except _OTEL_NONFATAL_EXC as e:
+        logger.warning(
+            "get_tracer failed (%s); returning no-op tracer: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "get_tracer",
+                   "error_type": type(e).__name__, "error": str(e)},
+        )
+        return _safe_tracer()
+    except Exception as e:  # noqa: BLE001 — telemetry must never raise into callers
+        logger.warning(
+            "get_tracer raised unexpected %s; returning no-op tracer: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "get_tracer",
+                   "error_type": type(e).__name__, "error": str(e)},
+        )
+        return _safe_tracer()
 
 
 def get_meter() -> metrics.Meter:
-    """Return the application meter (lazy-initializing OTel if needed)."""
+    """Return the application meter (lazy-initializing OTel if needed).
+
+    Never raises: any failure degrades to the SDK no-op meter with a single
+    structured warning.
+    """
     if not _initialized:
         setup_otel()
-    if _meter_provider is not None:
-        return _meter_provider.get_meter(_METER_NAME)
-    return metrics.get_meter(_METER_NAME)
+    try:
+        if _meter_provider is not None:
+            return _meter_provider.get_meter(_METER_NAME)
+        return metrics.get_meter(_METER_NAME)
+    except _OTEL_NONFATAL_EXC as e:
+        logger.warning(
+            "get_meter failed (%s); returning no-op meter: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "get_meter",
+                   "error_type": type(e).__name__, "error": str(e)},
+        )
+        return _safe_meter()
+    except Exception as e:  # noqa: BLE001 — telemetry must never raise into callers
+        logger.warning(
+            "get_meter raised unexpected %s; returning no-op meter: %s",
+            type(e).__name__, e,
+            extra={"component": "otel", "phase": "get_meter",
+                   "error_type": type(e).__name__, "error": str(e)},
+        )
+        return _safe_meter()
 
 
 P = ParamSpec("P")

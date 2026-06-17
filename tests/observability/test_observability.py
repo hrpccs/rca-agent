@@ -179,6 +179,153 @@ def test_setup_otel_disabled_is_noop(monkeypatch):
     assert t._meter_provider is None
 
 
+def test_setup_otel_construction_failure_degrades_to_noop(monkeypatch, caplog):
+    """If exporter / provider construction raises, setup_otel must degrade to
+    no-op providers, log a single structured warning, set _initialized, and
+    NEVER raise into the caller."""
+    monkeypatch.setattr(t, "_initialized", False)
+    monkeypatch.setattr(t, "_tracer_provider", None)
+    monkeypatch.setattr(t, "_meter_provider", None)
+    monkeypatch.setattr(t, "_logger_provider", None)
+    monkeypatch.setenv("RCA_OTEL_ENABLED", "true")
+    monkeypatch.setenv("RCA_OTEL_ENDPOINT", "http://127.0.0.1:4317")
+    get_settings.cache_clear()
+
+    # Force a concrete failure mid-construction: the span exporter import
+    # itself raises a ValueError (malformed endpoint). The except branches in
+    # setup_otel must catch it.
+    import opentelemetry.exporter.otlp.proto.grpc.trace_exporter as te
+
+    class _BoomExporter:
+        def __init__(self, *a, **kw):
+            raise ValueError("boom: malformed endpoint")
+
+        def shutdown(self, *a, **kw):
+            return None
+
+    monkeypatch.setattr(te, "OTLPSpanExporter", _BoomExporter)
+
+    with caplog.at_level("WARNING", logger="rca_agent.observability.tracing"):
+        # Must not raise.
+        t.setup_otel()
+
+    # Degraded to no-op providers.
+    assert t._initialized is True
+    assert t._tracer_provider is None
+    assert t._meter_provider is None
+    # Exactly one structured warning about the setup failure.
+    setup_warnings = [r for r in caplog.records
+                      if r.name == "rca_agent.observability.tracing"
+                      and "otel setup" in r.getMessage()]
+    assert len(setup_warnings) == 1, f"expected one setup warning, got {setup_warnings}"
+    rec = setup_warnings[0]
+    assert rec.levelname == "WARNING"
+    # Structured extra payload present + diagnosable.
+    assert getattr(rec, "component", None) == "otel"
+    assert getattr(rec, "phase", None) == "setup_otel"
+    assert getattr(rec, "error_type", None) == "ValueError"
+    assert "boom" in getattr(rec, "error", "")
+
+
+def test_setup_otel_partial_failure_after_tracer_installed(monkeypatch, caplog):
+    """A failure AFTER the tracer provider is globally installed (e.g. the
+    metric exporter constructor raising) must still: not raise, set
+    _initialized, log a single warning, and leave get_tracer/get_meter
+    returning usable no-op tracers/meters (the module globals are cleared so
+    callers fall back to the SDK no-op path). This covers the partial-state
+    window the pre-install failure test does not exercise."""
+    monkeypatch.setattr(t, "_initialized", False)
+    monkeypatch.setattr(t, "_tracer_provider", None)
+    monkeypatch.setattr(t, "_meter_provider", None)
+    monkeypatch.setattr(t, "_logger_provider", None)
+    monkeypatch.setenv("RCA_OTEL_ENABLED", "true")
+    monkeypatch.setenv("RCA_OTEL_ENDPOINT", "http://127.0.0.1:4317")
+    get_settings.cache_clear()
+
+    import opentelemetry.exporter.otlp.proto.grpc.metric_exporter as me
+    import opentelemetry.exporter.otlp.proto.grpc.trace_exporter as te
+
+    # Span exporter constructs fine (tracer provider WILL be installed)...
+    class _OkSpanExporter:
+        def export(self, *a, **kw):
+            return None
+
+        def shutdown(self, *a, **kw):
+            return None
+
+    # ...but the metric exporter blows up, AFTER set_tracer_provider ran.
+    class _BoomMetricExporter(me.OTLPMetricExporter):
+        def __init__(self, *a, **kw):
+            raise OSError("metric exporter boom")
+
+    monkeypatch.setattr(te, "OTLPSpanExporter", _OkSpanExporter)
+    monkeypatch.setattr(me, "OTLPMetricExporter", _BoomMetricExporter)
+
+    with caplog.at_level("WARNING", logger="rca_agent.observability.tracing"):
+        t.setup_otel()  # must not raise
+
+    # Degraded: _initialized set, module globals cleared so callers fall to
+    # the SDK no-op path (traces via the still-installed-but-discarded global
+    # provider, metrics via no-op).
+    assert t._initialized is True
+    assert t._tracer_provider is None
+    assert t._meter_provider is None
+    setup_warnings = [r for r in caplog.records
+                      if r.name == "rca_agent.observability.tracing"
+                      and "otel setup" in r.getMessage()]
+    assert len(setup_warnings) == 1
+    # get_tracer / get_meter must still hand back usable no-op instruments —
+    # never None, never raising — even from the degraded state.
+    tracer = t.get_tracer()
+    meter = t.get_meter()
+    assert tracer is not None
+    assert meter is not None
+    with tracer.start_as_current_span("post-failure"):
+        meter.create_counter("c").add(1, {})
+
+
+def test_get_tracer_never_raises(monkeypatch, caplog):
+    """get_tracer must return a usable tracer and never raise, even if the
+    installed provider's get_tracer raises — it falls back to the SDK no-op
+    tracer with a single warning."""
+    monkeypatch.setattr(t, "_initialized", True)
+
+    class _BrokenProvider:
+        def get_tracer(self, *a, **kw):
+            raise RuntimeError("provider broken")
+
+    monkeypatch.setattr(t, "_tracer_provider", _BrokenProvider())
+
+    with caplog.at_level("WARNING", logger="rca_agent.observability.tracing"):
+        tracer = t.get_tracer()
+    assert tracer is not None  # no-op tracer returned, not None
+    # A single warning was logged.
+    tracer_warnings = [r for r in caplog.records
+                       if "get_tracer" in r.getMessage()]
+    assert len(tracer_warnings) == 1
+    assert tracer_warnings[0].levelname == "WARNING"
+
+
+def test_get_meter_never_raises(monkeypatch, caplog):
+    """get_meter must return a usable meter and never raise, even if the
+    installed provider's get_meter raises — it falls back to the SDK no-op
+    meter with a single warning."""
+    monkeypatch.setattr(t, "_initialized", True)
+
+    class _BrokenProvider:
+        def get_meter(self, *a, **kw):
+            raise RuntimeError("provider broken")
+
+    monkeypatch.setattr(t, "_meter_provider", _BrokenProvider())
+
+    with caplog.at_level("WARNING", logger="rca_agent.observability.tracing"):
+        meter = t.get_meter()
+    assert meter is not None  # no-op meter returned, not None
+    meter_warnings = [r for r in caplog.records if "get_meter" in r.getMessage()]
+    assert len(meter_warnings) == 1
+    assert meter_warnings[0].levelname == "WARNING"
+
+
 # --------------------------------------------------------------------------- #
 # get_tracer / get_meter
 # --------------------------------------------------------------------------- #
@@ -293,6 +440,28 @@ def test_trace_rca_step_async(inmemory_providers):
     assert s.attributes["tool_name"] == "span_q"
 
 
+def test_trace_rca_step_async_records_exception_event(inmemory_providers):
+    """An async decorated fn that raises must yield a span with an exception
+    event + non-ok status, and re-raise to the caller."""
+    span_exporter, _ = inmemory_providers
+
+    @t.trace_rca_step("async_boom")
+    async def async_boom(case_id):
+        raise ValueError("async failure")
+
+    with pytest.raises(ValueError, match="async failure"):
+        asyncio.run(async_boom("case-x"))
+
+    spans = _collected_spans(span_exporter)
+    assert len(spans) == 1
+    s = spans[0]
+    assert s.name == "rca.async_boom"
+    assert not s.status.is_ok
+    assert any(ev.name == "exception" for ev in s.events)
+    # Call attributes are still attached on the exception path.
+    assert s.attributes["case_id"] == "case-x"
+
+
 def test_trace_rca_step_custom_step_kind_attr(inmemory_providers):
     span_exporter, _ = inmemory_providers
 
@@ -353,6 +522,23 @@ def test_record_provider_query_zero_duration_not_recorded(inmemory_providers):
     ) == 0.0
 
 
+def test_record_provider_query_none_duration_not_recorded(inmemory_providers):
+    """A None duration (timer never set) must not emit a histogram point
+    and must not raise — mirrors the zero/negative clamp guard."""
+    _, metric_reader = inmemory_providers
+    # ok=True so no error counter either; nothing should be emitted.
+    m.record_provider_query("metrics", "clickhouse", None, ok=True)  # type: ignore[arg-type]
+    snap = _metrics_snapshot(metric_reader)
+    assert _sum_values(
+        snap, "rca_provider_query_duration_seconds",
+        {"modality": "metrics", "backend": "clickhouse"},
+    ) == 0.0
+    # And the failed-query branch isn't triggered (ok=True).
+    assert _sum_values(
+        snap, "rca_provider_errors_total", {"modality": "metrics"},
+    ) == 0.0
+
+
 def test_record_memory_hits(inmemory_providers):
     _, metric_reader = inmemory_providers
     m.record_memory_hits("c1", 3)
@@ -366,6 +552,22 @@ def test_record_memory_hits_zero_not_recorded(inmemory_providers):
     _, metric_reader = inmemory_providers
     m.record_memory_hits("c1", 0)
     m.record_memory_hits("c1", -2)
+    snap = _metrics_snapshot(metric_reader)
+    found = False
+    if snap is not None:
+        for rm in snap.resource_metrics:
+            for sm in rm.scope_metrics:
+                for metric in sm.metrics:
+                    if metric.name == "rca_memory_retrieval_hits":
+                        found = True
+    assert not found
+
+
+def test_record_memory_hits_none_not_recorded(inmemory_providers):
+    """A None hit count (retrieval returned None) must not emit a point
+    and must not raise — mirrors the zero/negative clamp guard."""
+    _, metric_reader = inmemory_providers
+    m.record_memory_hits("c1", None)  # type: ignore[arg-type]
     snap = _metrics_snapshot(metric_reader)
     found = False
     if snap is not None:
@@ -414,6 +616,77 @@ def test_record_llm_tokens_zero_is_noop(inmemory_providers):
     # InMemoryMetricReader omits instruments with no data points, so the
     # rca_llm_tokens instrument should be entirely absent.
     assert not found
+
+
+def test_record_llm_tokens_none_is_noop(inmemory_providers):
+    """None token counts must not emit points and must not raise — mirrors
+    the zero/negative clamp guard."""
+    _, metric_reader = inmemory_providers
+    m.record_llm_tokens("m", prompt=None, completion=None)  # type: ignore[arg-type]
+    snap = _metrics_snapshot(metric_reader)
+    found = False
+    if snap is not None:
+        for rm in snap.resource_metrics:
+            for sm in rm.scope_metrics:
+                for metric in sm.metrics:
+                    if metric.name == "rca_llm_tokens":
+                        found = True
+    assert not found
+
+
+def test_record_llm_tokens_mixed_clamps_per_kind(inmemory_providers):
+    """A valid prompt with a None completion records only the prompt side,
+    and vice-versa — the clamp guard is applied per kind, not wholesale."""
+    _, metric_reader = inmemory_providers
+    m.record_llm_tokens("m", prompt=100, completion=None)  # type: ignore[arg-type]
+    m.record_llm_tokens("m", prompt=None, completion=40)  # type: ignore[arg-type]
+    snap = _metrics_snapshot(metric_reader)
+    assert _sum_values(snap, "rca_llm_tokens",
+                       {"kind": "prompt", "model": "m"}) == 100
+    assert _sum_values(snap, "rca_llm_tokens",
+                       {"kind": "completion", "model": "m"}) == 40
+
+
+# --------------------------------------------------------------------------- #
+# Concurrent recording (asyncio.gather must sum correctly)
+# --------------------------------------------------------------------------- #
+def test_concurrent_metric_recording_sums(inmemory_providers):
+    """Many coroutines recording metrics via asyncio.gather must sum to the
+    expected totals — the SDK Counter/Histogram add/record paths are not
+    awaited, so concurrent await-points must not drop or double-count."""
+    _, metric_reader = inmemory_providers
+    N = 50
+
+    async def worker(i: int) -> None:
+        # Interleave a couple of await points so the event loop actually
+        # schedules tasks concurrently.
+        await asyncio.sleep(0)
+        m.record_tool_call("query_logs", "ok", case_id=f"c{i}")
+        m.record_provider_query("metrics", "clickhouse", 0.1, ok=True)
+        m.record_memory_hits(f"c{i}", 2)
+        m.record_llm_tokens("m", prompt=10, completion=5)
+        m.record_step("observe")
+        await asyncio.sleep(0)
+
+    async def run_all() -> None:
+        # gather must run inside a coroutine so a loop is active.
+        await asyncio.gather(*(worker(i) for i in range(N)))
+
+    asyncio.run(run_all())
+
+    snap = _metrics_snapshot(metric_reader)
+    # The same case_id is used once per worker, so total counts == N for the
+    # per-case-attribute groupings.
+    assert _sum_values(snap, "rca_tool_calls_total",
+                       {"tool": "query_logs", "status": "ok"}) == N
+    assert _sum_values(snap, "rca_provider_query_duration_seconds",
+                       {"modality": "metrics", "backend": "clickhouse"}) == pytest.approx(0.1 * N)
+    assert _sum_values(snap, "rca_steps_total", {"step_kind": "observe"}) == N
+    # memory_hits: N distinct case_ids, 2 each -> total 2N across all cases.
+    assert _sum_values(snap, "rca_memory_retrieval_hits", {}) == 2 * N
+    # tokens: prompt 10*N + completion 5*N.
+    assert _sum_values(snap, "rca_llm_tokens", {"kind": "prompt", "model": "m"}) == 10 * N
+    assert _sum_values(snap, "rca_llm_tokens", {"kind": "completion", "model": "m"}) == 5 * N
 
 
 # --------------------------------------------------------------------------- #
