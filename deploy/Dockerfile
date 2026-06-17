@@ -8,8 +8,10 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1
 
-# Install runtime deps first (cache layer).
-COPY pyproject.toml uv.lock ./
+# Install runtime deps first (cache layer). README.md is required by hatchling
+# (pyproject declares readme = "README.md") to build the editable package, so it
+# must be present alongside pyproject.toml at this layer.
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev
 
 # App code + memory seed (small). Cases/infra are mounted, not baked.
