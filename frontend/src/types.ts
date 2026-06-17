@@ -105,6 +105,45 @@ export interface StartRcaResponse {
   case_id: string;
   backend: string;
   stream_url: string;
+  /**
+   * The persisted run id assigned by the backend. Present when the store is
+   * available; the frontend threads it onto the stream URL and uses it to
+   * best-effort recover the persisted trace if the SSE transport drops
+   * mid-run (GET /runs/{run_id}). Optional for backward compat with older
+   * backends that did not persist runs.
+   */
+  run_id?: string | null;
+}
+
+/**
+ * Summary of a persisted run, as returned by `GET /runs` (list view).
+ * Mirrors the backend's run-list projection: the heavy `steps` array is NOT
+ * included — load it on demand via {@link Run} / `GET /runs/{run_id}`.
+ */
+export interface RunSummary {
+  run_id: string;
+  case_id: string;
+  status: string;
+  model?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  token_usage?: TokenUsage | null;
+  step_count: number;
+}
+
+/**
+ * Full run record, as returned by `GET /runs/{run_id}`: the {@link RunSummary}
+ * fields plus the persisted `steps` array. The backend returns these as two
+ * sibling keys (`run` + `steps`) in the JSON body; {@link fetchRun} merges them.
+ *
+ * `report` is optional: when the backend persists the final RcaReport alongside
+ * the run (a sibling `report` key in the body), {@link fetchRun} surfaces it
+ * here so the UI can render the ReportCard on replay / disconnect recovery
+ * without a separate fetch. Absent for backends/runs that don't store it.
+ */
+export interface Run extends RunSummary {
+  steps: RcaStep[];
+  report?: RcaReport | null;
 }
 
 /** Data backend selector. */

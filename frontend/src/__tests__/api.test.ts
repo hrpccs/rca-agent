@@ -2,6 +2,9 @@ import { act, cleanup } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_IDLE_TIMEOUT_MS,
+  fetchRun,
+  fetchRunSteps,
+  fetchRuns,
   openRcaStream,
   shouldArmIdle,
   type StreamHandlers,
@@ -416,6 +419,240 @@ describe("openRcaStream — inactivity watchdog", () => {
       vi.advanceTimersByTime(10_000);
     });
     expect(handlers.calls.onError).toHaveLength(0);
+  });
+});
+
+describe("openRcaStream — run_id threading & onTransportClosed", () => {
+  let restore: () => void;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    const inst = installFakeEventSource();
+    restore = inst.cleanup;
+  });
+
+  afterEach(() => {
+    (globalThis as { fetch: unknown }).fetch = originalFetch;
+    restore();
+    vi.useRealTimers();
+  });
+
+  it("appends &run_id= to the stream URL when a runId is provided", () => {
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t007", "parquet", handlers, {
+      runId: "run-abc-123",
+    });
+    const es = fakeEs(handle);
+    expect(es.url).toContain("run_id=run-abc-123");
+    // backend param still present and correct
+    expect(es.url).toContain("backend=parquet");
+    handle.dispose();
+  });
+
+  it("omits run_id entirely from the URL when no runId is given", () => {
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t008", "clickhouse", handlers);
+    const es = fakeEs(handle);
+    expect(es.url).not.toContain("run_id");
+    expect(es.url).toContain("backend=clickhouse");
+    handle.dispose();
+  });
+
+  it("URL-encodes the run_id", () => {
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t009", "parquet", handlers, {
+      runId: "run with spaces&special",
+    });
+    const es = fakeEs(handle);
+    expect(es.url).toContain("run_id=run%20with%20spaces%26special");
+    handle.dispose();
+  });
+
+  it("fires onTransportClosed (with the runId) on a native transport CLOSED", () => {
+    const onTransportClosed = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t010", "parquet", handlers, {
+      runId: "run-dead",
+      onTransportClosed,
+    });
+    const es = fakeEs(handle);
+
+    es.simulateTransportError(true);
+
+    expect(onTransportClosed).toHaveBeenCalledTimes(1);
+    expect(onTransportClosed).toHaveBeenCalledWith("run-dead");
+    // onError also still fires (the banner signal).
+    expect(handlers.calls.onError).toHaveLength(1);
+    const [msg] = handlers.calls.onError[0] as [string, SseEvent];
+    expect(msg).toMatch(/stream closed for case t010/);
+    expect(es.isClosed()).toBe(true);
+    handle.dispose();
+  });
+
+  it("passes null to onTransportClosed when no runId was supplied", () => {
+    const onTransportClosed = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t011", "parquet", handlers, {
+      onTransportClosed,
+    });
+    const es = fakeEs(handle);
+
+    es.simulateTransportError(true);
+
+    expect(onTransportClosed).toHaveBeenCalledWith(null);
+    handle.dispose();
+  });
+
+  it("does NOT fire onTransportClosed on a CONNECTING retry (only on CLOSED)", () => {
+    const onTransportClosed = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t012", "parquet", handlers, {
+      runId: "run-retry",
+      onTransportClosed,
+    });
+    const es = fakeEs(handle);
+
+    // CONNECTING retry — not yet terminal.
+    es.readyState = FakeEventSource.CONNECTING;
+    es.simulateTransportError(false);
+    expect(onTransportClosed).not.toHaveBeenCalled();
+
+    // Now CLOSED — terminal.
+    es.simulateTransportError(true);
+    expect(onTransportClosed).toHaveBeenCalledTimes(1);
+    handle.dispose();
+  });
+
+  it("does NOT fire onTransportClosed after a clean done (teardown guard)", () => {
+    const onTransportClosed = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t013", "parquet", handlers, {
+      runId: "run-done",
+      onTransportClosed,
+    });
+    const es = fakeEs(handle);
+
+    es.dispatchEventMessage("done", envelope("done", "t013", {}, 1));
+    // Spurious CLOSED error after done must not fire the hook.
+    es.simulateTransportError(true);
+    expect(onTransportClosed).not.toHaveBeenCalled();
+    handle.dispose();
+  });
+
+  it("still fires onError even if onTransportClosed throws", () => {
+    const onTransportClosed = vi.fn(() => {
+      throw new Error("hook blew up");
+    });
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t014", "parquet", handlers, {
+      runId: "run-throw",
+      onTransportClosed,
+    });
+    const es = fakeEs(handle);
+
+    // The hook throwing must not suppress onError (the banner signal).
+    es.simulateTransportError(true);
+    expect(onTransportClosed).toHaveBeenCalledTimes(1);
+    expect(handlers.calls.onError).toHaveLength(1);
+    expect(es.isClosed()).toBe(true);
+    handle.dispose();
+  });
+});
+
+describe("run-persistence fetchers", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    (globalThis as { fetch: unknown }).fetch = originalFetch;
+  });
+
+  function mockJson(url: RegExp, body: unknown, status = 200) {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const u = typeof input === "string" ? input : input.toString();
+      if (url.test(u)) return new Response(JSON.stringify(body), { status });
+      return new Response("not mocked", { status: 404 });
+    });
+    (globalThis as { fetch: unknown }).fetch = fetchMock;
+    return fetchMock;
+  }
+
+  it("fetchRuns lists runs and parses the {runs:[]} envelope", async () => {
+    const body = {
+      runs: [
+        { run_id: "r1", case_id: "t001", status: "completed", step_count: 5 },
+        { run_id: "r2", case_id: "t001", status: "error", step_count: 2 },
+      ],
+    };
+    const fm = mockJson(/^\/runs/, body);
+    const runs = await fetchRuns("t001");
+    expect(runs).toHaveLength(2);
+    expect(runs[0].run_id).toBe("r1");
+    expect(runs[0].step_count).toBe(5);
+    // case_id filter is threaded as a query param.
+    expect(fm.mock.calls[0][0]).toBe("/runs?case_id=t001");
+  });
+
+  it("fetchRuns omits case_id query when not given", async () => {
+    const fm = mockJson(/^\/runs$/, { runs: [] });    await fetchRuns();
+    expect(fm.mock.calls[0][0]).toBe("/runs");
+  });
+
+  it("fetchRuns returns [] when the envelope has no runs key", async () => {
+    mockJson(/^\/runs/, {});    const runs = await fetchRuns("t001");
+    expect(runs).toEqual([]);
+  });
+
+  it("fetchRuns throws on non-OK", async () => {
+    (globalThis as { fetch: unknown }).fetch = vi.fn(async () =>
+      new Response("nope", { status: 500 }),
+    );    await expect(fetchRuns("t001")).rejects.toThrow(/fetchRuns failed: 500/);
+  });
+
+  it("fetchRun merges {run, steps} into a Run", async () => {
+    const body = {
+      run: { run_id: "r1", case_id: "t001", status: "completed", step_count: 1 },
+      steps: [{ step_id: "s1", case_id: "t001", step_kind: "observe" }],
+    };
+    mockJson(/^\/runs\/r1(\?|$)/, body);
+    const run = await fetchRun("r1");
+    expect(run.run_id).toBe("r1");
+    expect(run.status).toBe("completed");
+    expect(run.steps).toHaveLength(1);
+    expect(run.steps[0].step_kind).toBe("observe");
+  });
+
+  it("fetchRun defaults steps to [] when absent", async () => {
+    const body = { run: { run_id: "r2", case_id: "t001", status: "running", step_count: 0 } };
+    mockJson(/^\/runs\/r2(\?|$)/, body);    const run = await fetchRun("r2");
+    expect(run.steps).toEqual([]);
+  });
+
+  it("fetchRun throws on non-OK", async () => {
+    (globalThis as { fetch: unknown }).fetch = vi.fn(async () =>
+      new Response("nope", { status: 404 }),
+    );    await expect(fetchRun("missing")).rejects.toThrow(/fetchRun failed: 404/);
+  });
+
+  it("fetchRunSteps returns the steps array", async () => {
+    const body = { steps: [{ step_id: "s1", case_id: "t001", step_kind: "observe" }] };
+    mockJson(/^\/runs\/r1\/steps(\?|$)/, body);    const steps = await fetchRunSteps("r1");
+    expect(steps).toHaveLength(1);
+  });
+
+  it("fetchRunSteps defaults to [] when absent", async () => {
+    mockJson(/^\/runs\/r1\/steps(\?|$)/, {});    const steps = await fetchRunSteps("r1");
+    expect(steps).toEqual([]);
+  });
+
+  it("fetchRunSteps throws on non-OK", async () => {
+    (globalThis as { fetch: unknown }).fetch = vi.fn(async () =>
+      new Response("nope", { status: 500 }),
+    );    await expect(fetchRunSteps("r1")).rejects.toThrow(/fetchRunSteps failed: 500/);
   });
 });
 

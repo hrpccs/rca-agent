@@ -4,6 +4,13 @@ import type { RcaStep, StepKind } from "../types";
 interface TraceTimelineProps {
   steps: RcaStep[];
   running: boolean;
+  /**
+   * When true, render a small "replay" badge in the header to indicate the
+   * displayed trace is a persisted run being replayed (not the live run).
+   * Optional and purely cosmetic; defaults to false so existing callers are
+   * unaffected.
+   */
+  replay?: boolean;
 }
 
 /**
@@ -93,7 +100,7 @@ function TruncatedText({
 }
 
 /** The live streaming trace of RcaSteps, grouped by kind with tool pairing. */
-export function TraceTimeline({ steps, running }: TraceTimelineProps) {
+export function TraceTimeline({ steps, running, replay = false }: TraceTimelineProps) {
   const entries = useMemo(() => groupSteps(steps), [steps]);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -117,6 +124,7 @@ export function TraceTimeline({ steps, running }: TraceTimelineProps) {
         <h2>Trace Timeline · 追踪时间线</h2>
         <span className="timeline__count">
           {steps.length} step{steps.length === 1 ? "" : "s"}
+          {replay && <span className="timeline__replay">⟲ replay</span>}
           {running && <span className="timeline__live">● live</span>}
         </span>
       </div>
