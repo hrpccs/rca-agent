@@ -14,11 +14,15 @@ strings and a few cells are ``None``.
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..cases import load_case
@@ -41,6 +45,32 @@ from ..contracts.provider import (
 )
 
 __all__ = ["ParquetProvider", "render"]
+
+logger = logging.getLogger(__name__)
+
+# Bounded LRU table cache size (env-tunable, default 64). 0 is treated as the
+# default so a misconfigured env var never silently disables caching.
+_CACHE_MAX_ENV = "RCA_PARQUET_CACHE_MAX"
+_CACHE_MAX_DEFAULT = 64
+
+# Pyarrow / parquet IO + parse errors we treat as "this file is unusable".
+# ArrowException is the base class of all pyarrow errors.
+_PARQUET_IO_ERRORS: tuple[type[BaseException], ...] = (
+    pa.ArrowException,
+    OSError,
+    ValueError,
+)
+
+# Errors that the in-memory Table -> Python conversion (to_pylist) can raise
+# that are NOT pyarrow IO errors. to_pylist is pure data conversion (e.g. it
+# raises KeyError on map columns with duplicate keys, TypeError on
+# non-convertible cells), so we keep a wider net here than on the read path.
+_PYLIST_ERRORS: tuple[type[BaseException], ...] = (
+    pa.ArrowException,
+    ValueError,
+    KeyError,
+    TypeError,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -165,8 +195,28 @@ class ParquetProvider:
         self.case_id: str = case.task.task_id
         self.window: TimeWindow = case.task.alert_window
         self.case_dir: Path = Path(case.case_dir)
-        # opened-table cache keyed by (filename, frozenset(columns))
-        self._table_cache: dict[tuple[str, frozenset[str]], Any] = {}
+        # Bounded LRU table cache keyed by (filename, frozenset(columns)).
+        # Caching is read-through: a miss reads from disk, an evicted entry is
+        # dropped least-recently-used. Parsed ONCE at init from the env var; the
+        # default preserves the original caching benefit while bounding memory
+        # for long-lived providers.
+        self._table_cache: OrderedDict[tuple[str, frozenset[str]], Any] = OrderedDict()
+        self._cache_max: int = self._parse_cache_max(
+            os.environ.get(_CACHE_MAX_ENV, str(_CACHE_MAX_DEFAULT))
+        )
+
+    @staticmethod
+    def _parse_cache_max(raw: str) -> int:
+        """Parse ``RCA_PARQUET_CACHE_MAX`` once at init.
+
+        Non-positive or unparseable values resolve to the default so a
+        misconfigured env var never silently disables caching.
+        """
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return _CACHE_MAX_DEFAULT
+        return value if value > 0 else _CACHE_MAX_DEFAULT
 
     # -- construction ------------------------------------------------------- #
     @classmethod
@@ -181,27 +231,39 @@ class ParquetProvider:
     def _read(self, name: str, columns: list[str]) -> list[dict[str, Any]]:
         """Read selected columns of a case parquet file into list-of-dicts.
 
-        Returns [] if the file is missing/empty. Columns absent from the file
-        are dropped from the projection so missing columns never raise.
+        Returns [] if the file is missing/empty/unreadable. Columns absent
+        from the file are dropped from the projection so missing columns never
+        raise. Results are cached in a bounded LRU keyed by (name, columns).
         """
         path = self.case_dir / name
         if not path.exists():
             return []
         key = (name, frozenset(columns))
-        cached = self._table_cache.get(key)
-        if cached is not None:
-            table = cached
+        table = self._table_cache.get(key)
+        if table is not None:
+            # Cache hit: mark most-recently-used (move to end) for LRU eviction.
+            self._table_cache.move_to_end(key)
         else:
             try:
                 schema = pq.ParquetFile(path).schema_arrow
                 present = [c for c in columns if c in schema.names]
                 table = pq.read_table(path, columns=present) if present else pq.read_table(path)
-            except (OSError, ValueError):
+            except _PARQUET_IO_ERRORS as exc:
+                logger.warning(
+                    "parquet read failed case=%s file=%s error=%s",
+                    self.case_id, name, exc,
+                )
                 return []
             self._table_cache[key] = table
+            if len(self._table_cache) > self._cache_max:
+                self._table_cache.popitem(last=False)  # evict least-recently-used
         try:
             return table.to_pylist()
-        except Exception:
+        except _PYLIST_ERRORS as exc:
+            logger.warning(
+                "parquet to_pylist failed case=%s file=%s error=%s",
+                self.case_id, name, exc,
+            )
             return []
 
     # ------------------------------------------------------------------ #
