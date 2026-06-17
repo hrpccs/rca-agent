@@ -19,15 +19,19 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import clickhouse_connect
 import pyarrow as pa
 import pyarrow.parquet as pq
+from clickhouse_connect.driver.exceptions import (
+    DatabaseError,
+    OperationalError,
+)
 
-from ..cases import case_file, load_case, load_topology
+from ..cases import case_file, load_topology
 from ..config import get_settings
 
 if TYPE_CHECKING:
@@ -302,13 +306,13 @@ _TABLES: dict[str, tuple[str, dict[str, str], dict[str, str] | None]] = {
 # Large tables that must be streamed in chunks.
 _STREAMED = {"logs", "traces"}
 
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-def get_client(database: str | None = None) -> "Client":
+def get_client(database: str | None = None) -> Client:
     """Build a clickhouse_connect client from application settings.
 
     Uses the HTTP port (8123 by default); clickhouse_connect is an HTTP driver,
@@ -324,7 +328,7 @@ def get_client(database: str | None = None) -> "Client":
     )
 
 
-def ensure_schema(client: "Client") -> None:
+def ensure_schema(client: Client) -> None:
     """Create the canonical tables if they do not exist.
 
     Prefers ``rca_agent/providers/clickhouse_schema.sql`` (owned by another
@@ -346,7 +350,7 @@ def ensure_schema(client: "Client") -> None:
 def import_case(
     case_id: str,
     cases_dir: Path | str | None = None,
-    client: "Client | None" = None,
+    client: Client | None = None,
     modalities: list[str] | None = None,
 ) -> dict[str, int]:
     """Import one benchmark case into ClickHouse.
@@ -367,7 +371,9 @@ def import_case(
     Returns
     -------
     dict[str, int]
-        ``{table: rows_inserted}`` for every table touched.
+        ``{table: rows_inserted}`` for every table touched. Tables whose
+        import failed are recorded as ``0`` and the import proceeds with the
+        remaining tables — a single failing table never aborts the case.
     """
     owns_client = client is None
     if client is None:
@@ -379,15 +385,34 @@ def import_case(
         for modality, (table, cols, renames) in _TABLES.items():
             if modality not in want:
                 continue
-            results[table] = _import_parquet(
-                client, case_id, cases_dir, table, modality, cols, renames
+            results[table] = _import_table_safely(
+                case_id,
+                table,
+                _import_parquet,
+                client,
+                case_id,
+                cases_dir,
+                table,
+                modality,
+                cols,
+                renames,
             )
         if "topology" in want:
-            results["topology_entities"] = _import_topology_entities(
-                client, case_id, cases_dir
+            results["topology_entities"] = _import_table_safely(
+                case_id,
+                "topology_entities",
+                _import_topology_entities,
+                client,
+                case_id,
+                cases_dir,
             )
-            results["topology_edges"] = _import_topology_edges(
-                client, case_id, cases_dir
+            results["topology_edges"] = _import_table_safely(
+                case_id,
+                "topology_edges",
+                _import_topology_edges,
+                client,
+                case_id,
+                cases_dir,
             )
         return results
     finally:
@@ -398,7 +423,7 @@ def import_case(
 def import_cases(
     case_ids: list[str],
     cases_dir: Path | str | None = None,
-    client: "Client | None" = None,
+    client: Client | None = None,
     modalities: list[str] | None = None,
     force: bool = False,
 ) -> dict[str, dict[str, int]]:
@@ -428,23 +453,81 @@ def import_cases(
 # --------------------------------------------------------------------------- #
 # Internals
 # --------------------------------------------------------------------------- #
-def _case_has_rows(client: "Client", case_id: str) -> bool:
+# In clickhouse_connect, every concrete DB-API exception (ProgrammingError,
+# DataError, IntegrityError, InternalError, NotSupportedError, OperationalError)
+# is a subclass of DatabaseError. So the two sets below are deliberately
+# different:
+#   * _RETRIABLE_CH_ERRORS — truly transient (network blip / timeout / server
+#     briefly unreachable). Caught by the per-table import wrapper so a flaky
+#     connection does NOT abort the whole case; a genuine programming error
+#     (bad column name, type mismatch -> ProgrammingError) still surfaces loud.
+#   * _PROBE_TOLERABLE_ERRORS — used only by _case_has_rows, whose job is to
+#     answer "is this case already imported?". A missing table on a cold-start
+#     DB raises DatabaseError (UNKNOWN_TABLE); we want to treat that as
+#     "not imported yet" and re-import, so DatabaseError is tolerated there.
+_RETRIABLE_CH_ERRORS: tuple[type[BaseException], ...] = (OperationalError,)
+_PROBE_TOLERABLE_ERRORS: tuple[type[BaseException], ...] = (DatabaseError,)
+
+
+def _import_table_safely(
+    case_id: str,
+    table: str,
+    fn: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> int:
+    """Run one table's import; on a *retriable* CH error, log + return 0.
+
+    The case import continues with the remaining tables even if one fails on a
+    transient network/timeout error, rather than aborting the whole case. A
+    genuine programming error (bad column name, type mismatch) raises
+    ``ProgrammingError`` — which is NOT retriable — and propagates out so the
+    bug surfaces loudly instead of being silently recorded as ``0`` rows.
+    ``table`` and ``case_id`` are always named in the structured log.
+    """
+    try:
+        return int(fn(*args, **kwargs))
+    except _RETRIABLE_CH_ERRORS as exc:
+        logger.error(
+            "import_case: failed to import table=%s case_id=%s — %s; "
+            "continuing with remaining tables",
+            table,
+            case_id,
+            exc,
+            extra={"case_id": case_id, "table": table, "error": str(exc)},
+        )
+        return 0
+
+
+def _case_has_rows(client: Client, case_id: str) -> bool:
     """True if any canonical table already has rows for this case."""
-    for table in _TABLES.values():
+    for name, _cols, _renames in _TABLES.values():
         try:
             n = client.query(
-                f"SELECT count() FROM {table[0]} WHERE case_id = %(cid)s",
+                f"SELECT count() FROM {name} WHERE case_id = %(cid)s",
                 parameters={"cid": case_id},
             ).first_item["count()"]
             if n and int(n) > 0:
                 return True
-        except Exception:  # noqa: BLE001 - table may not exist yet
+        except _PROBE_TOLERABLE_ERRORS as exc:
+            # Table may not exist yet (first import on a fresh DB raises
+            # DatabaseError/UNKNOWN_TABLE) or the server is transiently
+            # unreachable. Log at debug — this is the expected cold-start
+            # path, not an error. Treat as "not imported" so the case is
+            # (re)imported.
+            logger.debug(
+                "import_cases: could not query %s for case_id=%s — %s",
+                name,
+                case_id,
+                exc,
+                extra={"case_id": case_id, "table": name, "error": str(exc)},
+            )
             continue
     return False
 
 
 def _import_parquet(
-    client: "Client",
+    client: Client,
     case_id: str,
     cases_dir: Path | str | None,
     table: str,
@@ -462,7 +545,7 @@ def _import_parquet(
 
 
 def _insert_table_obj(
-    client: "Client",
+    client: Client,
     table: str,
     cols: dict[str, str],
     table_obj: pa.Table,
@@ -499,7 +582,7 @@ def _insert_table_obj(
 
 
 def _insert_chunk(
-    client: "Client",
+    client: Client,
     table: str,
     chunk: pa.Table,
     case_id: str,
@@ -687,12 +770,12 @@ def _safe_datetime(v: Any) -> datetime:
         return _EPOCH
     if isinstance(v, datetime):
         if v.tzinfo is None:
-            return v.replace(tzinfo=timezone.utc)
-        return v.astimezone(timezone.utc)
+            return v.replace(tzinfo=UTC)
+        return v.astimezone(UTC)
     if isinstance(v, (int, float)):
         try:
             # Treat large ints as microseconds epoch.
-            return datetime.fromtimestamp(float(v) / 1_000_000, tz=timezone.utc)
+            return datetime.fromtimestamp(float(v) / 1_000_000, tz=UTC)
         except (OverflowError, OSError, ValueError):
             return _EPOCH
     if isinstance(v, str):
@@ -704,7 +787,7 @@ def _safe_datetime(v: Any) -> datetime:
             return dt
         # Try numeric fallback (epoch ms / us).
         try:
-            return datetime.fromtimestamp(float(s) / 1_000_000, tz=timezone.utc)
+            return datetime.fromtimestamp(float(s) / 1_000_000, tz=UTC)
         except (OverflowError, OSError, ValueError):
             return _EPOCH
     return _EPOCH
@@ -742,15 +825,15 @@ def _parse_iso(s: str) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 # --------------------------------------------------------------------------- #
 # Topology import (from topology.json via load_case/load_topology)
 # --------------------------------------------------------------------------- #
 def _import_topology_entities(
-    client: "Client", case_id: str, cases_dir: Path | str | None
+    client: Client, case_id: str, cases_dir: Path | str | None
 ) -> int:
     topology = load_topology(case_id, cases_dir)
     cols = list(_TOPO_ENT_COLS.keys())
@@ -772,7 +855,7 @@ def _import_topology_entities(
 
 
 def _import_topology_edges(
-    client: "Client", case_id: str, cases_dir: Path | str | None
+    client: Client, case_id: str, cases_dir: Path | str | None
 ) -> int:
     topology = load_topology(case_id, cases_dir)
     cols = list(_TOPO_EDGE_COLS.keys())
