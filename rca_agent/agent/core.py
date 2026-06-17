@@ -182,6 +182,48 @@ class RcaAgent:
         oa_tools = build_openai_tools(self.tools)
 
         steps: list[RcaStep] = []
+
+        # Surface the memory module's interaction in the trace (DISPLAY ONLY).
+        # This step records that priors were retrieved and what entities they
+        # carried, so a persisted/replayed trace shows the memory module at work.
+        # It is NEVER appended to the LLM's context: the only thing that feeds
+        # the model below is `state = self.cm.append_tool_result(...)` (plus the
+        # initial assemble_turn above, which already baked `hits` into the brief
+        # independently of this step). Adding it to `steps` makes it land in the
+        # final RcaReport for display/persistence; yielding it streams it live.
+        # Defensive about pluggable backends: a malformed MemoryItem (missing,
+        # None, or non-list `.entities` — e.g. a bare string, which would
+        # otherwise iterate character-by-character) must not crash the loop or
+        # emit garbage entities. `_mem_entities` only flattens lists-of-str and
+        # skips anything else. The outer `isinstance(hits, list)` normalizes a
+        # backend that hands back a single item/dict instead of a list —
+        # `len(hits)` and the comprehension would otherwise raise.
+        def _mem_entities() -> list[str]:
+            out: list[str] = []
+            for h in hits:
+                ent_list = getattr(h, "entities", None)
+                if not isinstance(ent_list, list):
+                    continue
+                for e in ent_list:
+                    if isinstance(e, str) and e:
+                        out.append(e)
+            return sorted(set(out))[:20]
+
+        if isinstance(hits, list) and hits:
+            mem_step = RcaStep(
+                step_id=self._step_id(case_id),
+                case_id=case_id,
+                step_kind=StepKind.REASONING,
+                thought=(
+                    f"memory: retrieved {len(hits)} prior(s) for "
+                    f"{case.task.alert_title!r}"
+                ),
+                entities=_mem_entities(),
+            )
+            steps.append(mem_step)
+            yield mem_step
+            _safe_otel("record_step", "memory")
+
         usage_total = {
             "prompt_tokens": 0,
             "completion_tokens": 0,

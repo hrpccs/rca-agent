@@ -295,6 +295,155 @@ async def test_memory_seed_failure_does_not_crash_run(sample_case):
     assert reports[-1].root_cause.confidence == pytest.approx(0.85)
 
 
+# --------------------------------------------------------------------------- #
+# T3: memory-retrieval surfaced as a display-only trace step.
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingLLM(FakeLLM):
+    """FakeLLM that records every LLMRequest it is handed, so tests can assert
+    the display-only memory step never leaks into the model's context."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.received: list[Any] = []
+
+    async def complete(self, req):
+        self.received.append(req)
+        return await super().complete(req)
+
+
+def _seeded_memory(*items):
+    """Build an InMemoryStore preloaded with the given MemoryItems."""
+    store = InMemoryStore()
+    store.index(list(items))
+    return store
+
+
+@pytest.mark.asyncio
+async def test_memory_retrieval_yields_display_step_before_first_reasoning(sample_case):
+    """When memory returns >=1 hit, run() yields a REASONING step that mentions
+    memory/priors, carrying the retrieved entities, BEFORE any LLM-driven
+    reasoning step appears."""
+    from rca_agent.contracts import MemoryItem, RcaReport, RcaStep, StepKind
+
+    mem = _seeded_memory(
+        MemoryItem(
+            id="rb-1",
+            case_id="__global__",
+            content="Runbook: checkout 5xx — check payment service tokens.",
+            kind="runbook",
+            entities=["payment", "checkout", "loyalty"],
+        ),
+    )
+    agent = RcaAgent(
+        provider=FakeProvider(),
+        llm=_RecordingLLM(),
+        memory=mem,
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), mem),
+        max_steps=4,
+    )
+
+    events = [e async for e in agent.run(sample_case)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    mem_steps = [
+        s for s in steps
+        if s.step_kind == StepKind.REASONING and s.thought and "memory" in s.thought
+    ]
+    assert mem_steps, "no memory step yielded despite hits"
+    mem_step = mem_steps[0]
+    assert "prior" in mem_step.thought
+    assert sample_case.task.alert_title in mem_step.thought
+    # Entities from the retrieved MemoryItem are surfaced as context.
+    assert "payment" in mem_step.entities
+    assert "loyalty" in mem_step.entities
+
+    # The memory step must come BEFORE the first LLM-driven reasoning step (the
+    # one whose thought is NOT the memory line).
+    llm_reason_idx = next(
+        i for i, s in enumerate(steps)
+        if s.step_kind == StepKind.REASONING and not (s.thought or "").startswith("memory:")
+    )
+    assert steps.index(mem_step) < llm_reason_idx
+
+    # Regression: the run still completes and the memory step is in report.steps.
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports and reports[-1].status == "completed"
+    assert mem_step.step_id in {s.step_id for s in reports[-1].steps}
+
+
+@pytest.mark.asyncio
+async def test_no_memory_step_when_hits_empty(sample_case):
+    """When memory returns no hits, NO memory step is yielded (but the run
+    still completes normally)."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    # Empty InMemoryStore -> retrieve_for_context returns [].
+    mem = InMemoryStore()
+    agent = RcaAgent(
+        provider=FakeProvider(),
+        llm=FakeLLM(),
+        memory=mem,
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), mem),
+        max_steps=4,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+    assert not any(
+        s.step_kind == StepKind.REASONING and s.thought and "memory" in s.thought
+        for s in steps
+    ), "memory step yielded despite empty hits"
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports and reports[-1].status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_memory_step_not_in_llm_context(sample_case):
+    """The display-only memory step must NEVER be fed to the LLM. Assert the
+    memory thought text does not appear anywhere in the messages handed to the
+    model, so the ReAct loop / token usage / final answer are byte-for-byte
+    unaffected by this display step."""
+    from rca_agent.contracts import MemoryItem
+
+    mem = _seeded_memory(
+        MemoryItem(
+            id="rb-1",
+            case_id="__global__",
+            content="SOP: checkout errors — verify payment token validation.",
+            kind="sop",
+            entities=["payment"],
+        ),
+    )
+    rec_llm = _RecordingLLM()
+    agent = RcaAgent(
+        provider=FakeProvider(),
+        llm=rec_llm,
+        memory=mem,
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), mem),
+        max_steps=4,
+    )
+    # Drain the generator so every LLM call is recorded.
+    _ = [e async for e in agent.run(sample_case)]
+
+    assert rec_llm.received, "LLM was never called"
+    # Concatenate all message contents the model saw and assert the memory
+    # display-text is absent (the memory PRIORS are legitimately in the brief;
+    # only the synthetic 'memory: retrieved ...' thought must not leak).
+    forbidden = "memory: retrieved"
+    for req in rec_llm.received:
+        blob = json.dumps(
+            [getattr(m, "model_dump", lambda: {})() for m in req.messages],
+            ensure_ascii=False, default=str,
+        )
+        assert forbidden not in blob, (
+            f"display-only memory step leaked into LLM messages: {blob[:200]}"
+        )
+
+
 class _BrokenMetrics:
     """Module shim whose every attribute lookup raises ImportError."""
 
