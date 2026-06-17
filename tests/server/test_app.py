@@ -36,9 +36,12 @@ from rca_agent.server.app import (
     set_agent_factory,
     set_case_lister,
     set_report_store_factory,
+    set_trace_store_factory,
 )
 
 KNOWN_CASES = ["t001", "t002"]
+# A fixed 32-char hex run_id the fake trace store hands out.
+FIXED_RUN_ID = "0123456789abcdef0123456789abcdef"
 
 
 # --------------------------------------------------------------------------- #
@@ -49,9 +52,12 @@ class FakeReportStore:
 
     def __init__(self) -> None:
         self.saved: list[RcaReport] = []
+        # run_id passed alongside each save_report call (parallel to ``saved``).
+        self.saved_run_ids: list[str | None] = []
 
     def save_report(self, report: RcaReport, run_id: str | None = None) -> str:
         self.saved.append(report)
+        self.saved_run_ids.append(run_id)
         return f"rid-{len(self.saved)}"
 
     def list_reports(
@@ -59,6 +65,71 @@ class FakeReportStore:
     ) -> list[RcaReport]:
         rows = [r for r in self.saved if case_id is None or r.case_id == case_id]
         return list(reversed(rows[-limit:]))
+
+
+class FakeTraceStore:
+    """In-memory stand-in for MysqlStore's run/trace methods.
+
+    Records the order and arguments of every persistence call so tests can
+    assert that steps are persisted in order, runs are closed with the right
+    terminal status, and a run_id minted at POST time is honored through the
+    stream. Structurally satisfies the server's ``TraceStore`` Protocol.
+    """
+
+    def __init__(self, run_id: str = FIXED_RUN_ID) -> None:
+        self.run_id = run_id
+        self.started_runs: list[tuple[str, str]] = []  # (case_id, model)
+        self.finished_runs: list[tuple[str, str, dict | None]] = []
+        # (run_id, case_id, seq, step)
+        self.appended_steps: list[tuple[str, str, int, RcaStep]] = []
+        # run_id -> list of runs-dict rows for list_runs/get_run.
+        self.run_rows: dict[str, dict[str, Any]] = {}
+        # run_id -> list of steps for list_steps.
+        self.step_rows: dict[str, list[RcaStep]] = {}
+
+    def start_run(self, case_id: str, model: str) -> str:
+        self.started_runs.append((case_id, model))
+        self.run_rows.setdefault(
+            self.run_id,
+            {
+                "run_id": self.run_id,
+                "case_id": case_id,
+                "status": "running",
+                "model": model,
+            },
+        )
+        self.step_rows.setdefault(self.run_id, [])
+        return self.run_id
+
+    def finish_run(
+        self,
+        run_id: str,
+        status: str,
+        token_usage: dict[str, Any] | None = None,
+    ) -> None:
+        self.finished_runs.append((run_id, status, token_usage))
+        if run_id in self.run_rows:
+            self.run_rows[run_id]["status"] = status
+
+    def append_step(
+        self, run_id: str, case_id: str, seq: int, step: RcaStep
+    ) -> None:
+        self.appended_steps.append((run_id, case_id, seq, step))
+        self.step_rows.setdefault(run_id, []).append(step)
+
+    def list_runs(
+        self, case_id: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        rows = list(self.run_rows.values())
+        if case_id is not None:
+            rows = [r for r in rows if r.get("case_id") == case_id]
+        return rows[:limit]
+
+    def list_steps(self, run_id: str, limit: int = 20000) -> list[RcaStep]:
+        return list(self.step_rows.get(run_id, []))[:limit]
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        return self.run_rows.get(run_id)
 
 
 class FakeAgent:
@@ -167,10 +238,18 @@ def fake_store() -> FakeReportStore:
 
 
 @pytest.fixture
-def client(fake_store: FakeReportStore) -> TestClient:
-    """A TestClient wired to synthetic cases + injected store + fake agent."""
+def fake_trace() -> FakeTraceStore:
+    return FakeTraceStore()
+
+
+@pytest.fixture
+def client(
+    fake_store: FakeReportStore, fake_trace: FakeTraceStore
+) -> TestClient:
+    """A TestClient wired to synthetic cases + injected stores + fake agent."""
     set_case_lister(lambda: list(KNOWN_CASES))
     set_report_store_factory(lambda: fake_store)
+    set_trace_store_factory(lambda: fake_trace)
     set_agent_factory(_make_factory())
     # Raise any server-side exceptions in the test process (TestClient default
     # already does this for sync handlers; we keep it explicit for clarity).
@@ -178,6 +257,7 @@ def client(fake_store: FakeReportStore) -> TestClient:
     # Restore production defaults so other test modules are unaffected.
     set_case_lister(None)
     set_report_store_factory(None)
+    set_trace_store_factory(None)
     set_agent_factory(None)
 
 
@@ -275,7 +355,12 @@ def test_start_rca_accepted_for_known_case(client: TestClient):
     assert r.status_code == 200
     body = r.json()
     assert body["case_id"] == "t001"
-    assert body["stream_url"] == "/rca/t001/stream?backend=parquet"
+    # POST mints a run_id via the injected fake trace store and threads it into
+    # the stream_url so the frontend can re-fetch the trace after a disconnect.
+    assert body["run_id"] == FIXED_RUN_ID
+    assert body["stream_url"] == (
+        f"/rca/t001/stream?backend=parquet&run_id={FIXED_RUN_ID}"
+    )
 
 
 def test_start_rca_404_for_unknown_case(client: TestClient):
@@ -286,8 +371,10 @@ def test_start_rca_404_for_unknown_case(client: TestClient):
 def test_start_rca_respects_backend_query(client: TestClient):
     r = client.post("/rca/t001?backend=clickhouse")
     assert r.status_code == 200
-    assert r.json()["backend"] == "clickhouse"
-    assert "backend=clickhouse" in r.json()["stream_url"]
+    body = r.json()
+    assert body["backend"] == "clickhouse"
+    assert "backend=clickhouse" in body["stream_url"]
+    assert f"run_id={FIXED_RUN_ID}" in body["stream_url"]
 
 
 # --------------------------------------------------------------------------- #
@@ -490,3 +577,494 @@ def test_valid_case_ids_pass_validation(client: TestClient, good_id: str):
         assert r.status_code == 200, f"valid id {good_id} rejected with {r.status_code}"
     finally:
         set_case_lister(None)
+
+
+# --------------------------------------------------------------------------- #
+# T2: incremental trace persistence + run_id flow
+# --------------------------------------------------------------------------- #
+def test_stream_persists_steps_in_order_then_closes_run(
+    client: TestClient, fake_trace: FakeTraceStore, fake_store: FakeReportStore
+):
+    """Each emitted RcaStep is persisted in order with the right seq; the run is
+    closed with the report's terminal status and token_usage; save_report is
+    still called on the report store."""
+    with client.stream(
+        "GET", f"/rca/t001/stream?run_id={FIXED_RUN_ID}"
+    ) as resp:
+        assert resp.status_code == 200
+        resp.read()
+
+    # Two scripted steps persisted, seq values 1 and 2 (seq increments once per
+    # emitted item, steps come first), in insertion order.
+    assert len(fake_trace.appended_steps) == 2
+    seqs = [rec[2] for rec in fake_trace.appended_steps]
+    assert seqs == [1, 2]
+    step_ids = [rec[3].step_id for rec in fake_trace.appended_steps]
+    assert step_ids == ["t001-s1", "t001-s2"]
+    # All persisted against the run_id carried by the stream query param.
+    assert all(rec[0] == FIXED_RUN_ID for rec in fake_trace.appended_steps)
+
+    # Run closed exactly once with completed status + the report's token_usage.
+    assert len(fake_trace.finished_runs) == 1
+    run_id, status, usage = fake_trace.finished_runs[0]
+    assert run_id == FIXED_RUN_ID
+    assert status == "completed"
+    # token_usage on the scripted report is None -> passed through as None.
+    assert usage is None
+
+    # The report is still saved to the report store (no regression).
+    assert len(fake_store.saved) == 1
+    assert fake_store.saved[0].case_id == "t001"
+
+
+def test_stream_mints_run_id_when_none_passed(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    """A stream opened without ?run_id= mints one via start_run so each step is
+    still persisted incrementally."""
+    with client.stream("GET", "/rca/t001/stream") as resp:
+        assert resp.status_code == 200
+        resp.read()
+    # start_run was called exactly once in the stream (POST was not used here).
+    assert len(fake_trace.started_runs) == 1
+    case_id, model = fake_trace.started_runs[0]
+    assert case_id == "t001"
+    assert model  # deepseek_model default is non-empty
+    # Steps were persisted against the minted run_id.
+    assert fake_trace.appended_steps
+    assert all(rec[0] == FIXED_RUN_ID for rec in fake_trace.appended_steps)
+
+
+def test_stream_run_id_query_param_is_honored_not_reminted(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    """When ?run_id= is supplied, the stream must NOT call start_run again."""
+    with client.stream(
+        "GET", f"/rca/t001/stream?run_id={FIXED_RUN_ID}"
+    ) as resp:
+        resp.read()
+    assert fake_trace.started_runs == []  # not re-minted
+    assert fake_trace.appended_steps  # still persisted against the passed id
+
+
+def test_stream_persists_steps_before_exception_and_closes_as_error(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    """A raising producer still emits ERROR and closes the run as 'error'; steps
+    emitted before the raise were already persisted."""
+
+    class RaisingAgent:
+        async def run(self, case):
+            yield _scripted_trace("t001")[0]  # one step before the blow-up
+            raise RuntimeError("boom-in-agent")
+            yield  # pragma: no cover - unreachable
+
+    def factory(case_id, backend=None, **kw):
+        return _fake_case(case_id), RaisingAgent()
+
+    set_agent_factory(factory)
+    try:
+        with client.stream(
+            "GET", f"/rca/t001/stream?run_id={FIXED_RUN_ID}"
+        ) as resp:
+            assert resp.status_code == 200
+            body = resp.read().decode()
+    finally:
+        set_agent_factory(None)
+
+    events = _parse_sse_events(body)
+    kinds = [e["event"] for e in events]
+    assert "step" in kinds
+    assert kinds[-1] == "error"
+
+    # The pre-exception step was persisted.
+    assert len(fake_trace.appended_steps) == 1
+    assert fake_trace.appended_steps[0][3].step_id == "t001-s1"
+    # Run closed as errored (no token_usage on the error path).
+    assert fake_trace.finished_runs == [(FIXED_RUN_ID, "error", None)]
+
+
+def test_stream_bad_run_id_returns_400(client: TestClient):
+    """A run_id that is not 32-char hex is rejected before reaching the store."""
+    r = client.get("/rca/t001/stream?run_id=not-a-real-id")
+    assert r.status_code == 400
+
+
+def test_stream_trace_failure_does_not_break_stream(
+    fake_store: FakeReportStore,
+):
+    """If the trace store itself raises on construction, the stream must still
+    deliver steps/report/done and call save_report — persistence is best-effort."""
+    set_case_lister(lambda: list(KNOWN_CASES))
+    set_report_store_factory(lambda: fake_store)
+    set_agent_factory(_make_factory())
+
+    def exploding_trace():
+        raise RuntimeError("trace store down")
+
+    set_trace_store_factory(exploding_trace)
+    try:
+        client = TestClient(fastapi_app)
+        with client.stream("GET", "/rca/t001/stream") as resp:
+            assert resp.status_code == 200
+            body = resp.read().decode()
+    finally:
+        set_case_lister(None)
+        set_report_store_factory(None)
+        set_trace_store_factory(None)
+        set_agent_factory(None)
+
+    events = _parse_sse_events(body)
+    kinds = [e["event"] for e in events]
+    assert kinds.count("step") == 2
+    assert "report" in kinds
+    assert kinds[-1] == "done"
+    assert len(fake_store.saved) == 1
+
+
+def test_start_rca_run_id_none_when_trace_store_down(
+    fake_store: FakeReportStore,
+):
+    """POST /rca must still succeed (200) with run_id=None when the trace store
+    is unavailable — and the stream_url must omit the run_id param."""
+    set_case_lister(lambda: list(KNOWN_CASES))
+    set_report_store_factory(lambda: fake_store)
+
+    def exploding_trace():
+        raise RuntimeError("trace store down")
+
+    set_trace_store_factory(exploding_trace)
+    set_agent_factory(_make_factory())
+    try:
+        client = TestClient(fastapi_app)
+        r = client.post("/rca/t001")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["run_id"] is None
+        assert "run_id=" not in body["stream_url"]
+        assert body["stream_url"] == "/rca/t001/stream?backend=parquet"
+    finally:
+        set_case_lister(None)
+        set_report_store_factory(None)
+        set_trace_store_factory(None)
+        set_agent_factory(None)
+
+
+# --------------------------------------------------------------------------- #
+# GET /runs, /runs/{run_id}, /runs/{run_id}/steps, /cases/{case_id}/runs
+# --------------------------------------------------------------------------- #
+def test_list_runs_returns_fake_store_envelope(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    # Seed two runs in the fake store.
+    fake_trace.run_rows = {
+        FIXED_RUN_ID: {
+            "run_id": FIXED_RUN_ID,
+            "case_id": "t001",
+            "status": "completed",
+        },
+        "fedcba9876543210fedcba9876543210": {
+            "run_id": "fedcba9876543210fedcba9876543210",
+            "case_id": "t002",
+            "status": "running",
+        },
+    }
+    r = client.get("/runs")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body["runs"], list)
+    assert len(body["runs"]) == 2
+
+
+def test_list_runs_filters_by_case_id(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    fake_trace.run_rows = {
+        FIXED_RUN_ID: {
+            "run_id": FIXED_RUN_ID,
+            "case_id": "t001",
+            "status": "completed",
+        },
+        "fedcba9876543210fedcba9876543210": {
+            "run_id": "fedcba9876543210fedcba9876543210",
+            "case_id": "t002",
+            "status": "running",
+        },
+    }
+    r = client.get("/runs?case_id=t001")
+    assert r.status_code == 200
+    runs = r.json()["runs"]
+    assert len(runs) == 1
+    assert runs[0]["case_id"] == "t001"
+
+
+def test_list_runs_400_for_bad_case_id(client: TestClient):
+    r = client.get("/runs?case_id=bad/id")
+    assert r.status_code == 400
+
+
+def test_list_runs_503_when_store_raises(client: TestClient):
+    def exploding():
+        raise RuntimeError("connection refused")
+
+    set_trace_store_factory(exploding)
+    try:
+        r = client.get("/runs")
+        assert r.status_code == 503
+        assert "storage unavailable" in r.json()["detail"]
+    finally:
+        set_trace_store_factory(None)
+
+
+def test_get_run_returns_summary_and_steps(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    step = RcaStep(
+        step_id="t001-s1",
+        case_id="t001",
+        step_kind=StepKind.REASONING,
+        thought="hi",
+    )
+    fake_trace.run_rows = {
+        FIXED_RUN_ID: {
+            "run_id": FIXED_RUN_ID,
+            "case_id": "t001",
+            "status": "completed",
+        }
+    }
+    fake_trace.step_rows = {FIXED_RUN_ID: [step]}
+
+    r = client.get(f"/runs/{FIXED_RUN_ID}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["run"]["run_id"] == FIXED_RUN_ID
+    assert len(body["steps"]) == 1
+    assert body["steps"][0]["step_id"] == "t001-s1"
+
+
+def test_get_run_404_for_unknown_run(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    # Empty store: get_run returns None.
+    r = client.get(f"/runs/{FIXED_RUN_ID}")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "unknown run"
+
+
+def test_get_run_400_for_bad_run_id(client: TestClient):
+    r = client.get("/runs/not-hex")
+    assert r.status_code == 400
+
+
+def test_get_run_503_when_store_raises(client: TestClient):
+    def exploding():
+        raise RuntimeError("connection refused")
+
+    set_trace_store_factory(exploding)
+    try:
+        r = client.get(f"/runs/{FIXED_RUN_ID}")
+        assert r.status_code == 503
+    finally:
+        set_trace_store_factory(None)
+
+
+def test_list_run_steps_endpoint(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    step = RcaStep(
+        step_id="t001-s1",
+        case_id="t001",
+        step_kind=StepKind.TOOL_CALL,
+        tool_name="query_logs",
+    )
+    fake_trace.step_rows = {FIXED_RUN_ID: [step]}
+
+    r = client.get(f"/runs/{FIXED_RUN_ID}/steps")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["steps"]) == 1
+    assert body["steps"][0]["tool_name"] == "query_logs"
+
+
+def test_list_run_steps_400_for_bad_run_id(client: TestClient):
+    r = client.get("/runs/zzz/steps")
+    assert r.status_code == 400
+
+
+def test_list_case_runs_endpoint(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    fake_trace.run_rows = {
+        FIXED_RUN_ID: {
+            "run_id": FIXED_RUN_ID,
+            "case_id": "t001",
+            "status": "completed",
+        }
+    }
+    r = client.get("/cases/t001/runs")
+    assert r.status_code == 200
+    runs = r.json()["runs"]
+    assert len(runs) == 1
+    assert runs[0]["case_id"] == "t001"
+
+
+def test_list_case_runs_400_for_bad_case_id(client: TestClient):
+    # A path-separator id never reaches the handler (the router collapses it),
+    # so it must NOT be 200. A safe (4xx) outcome is the contract.
+    r = client.get("/cases/bad/id/runs")
+    assert r.status_code != 200
+    # A bad id that DOES reach the handler as a single segment is 400.
+    r = client.get("/cases/bad;id/runs")
+    assert r.status_code == 400
+
+
+def test_list_case_runs_503_when_store_raises(client: TestClient):
+    def exploding():
+        raise RuntimeError("connection refused")
+
+    set_trace_store_factory(exploding)
+    try:
+        r = client.get("/cases/t001/runs")
+        assert r.status_code == 503
+    finally:
+        set_trace_store_factory(None)
+
+
+# --------------------------------------------------------------------------- #
+# Heartbeat regression — ping still emitted on a slow producer
+# --------------------------------------------------------------------------- #
+def test_heartbeat_ping_emitted_on_slow_producer(
+    fake_store: FakeReportStore, fake_trace: FakeTraceStore, monkeypatch
+):
+    """A producer that sleeps longer than the heartbeat interval must yield at
+    least one ping before the first real event. Guards against regressing the
+    unnamed keepalive message that re-arms the client watchdog."""
+    import asyncio
+
+    set_case_lister(lambda: list(KNOWN_CASES))
+    set_report_store_factory(lambda: fake_store)
+    set_trace_store_factory(lambda: fake_trace)
+    # Tight heartbeat so the test stays fast. The producer sleeps much longer
+    # than the heartbeat (0.5s vs 0.05s — a 10x margin) so the ping reliably
+    # fires before the first real event even under CI scheduling jitter.
+    monkeypatch.setenv("RCA_SSE_HEARTBEAT_SEC", "0.05")
+
+    class SlowAgent:
+        async def run(self, case):
+            await asyncio.sleep(0.5)
+            yield _scripted_trace("t001")[0]
+            yield _scripted_trace("t001")[2]  # report -> terminal
+
+    def factory(case_id, backend=None, **kw):
+        return _fake_case(case_id), SlowAgent()
+
+    set_agent_factory(factory)
+    try:
+        client = TestClient(fastapi_app)
+        with client.stream("GET", "/rca/t001/stream") as resp:
+            assert resp.status_code == 200
+            body = resp.read().decode()
+    finally:
+        set_case_lister(None)
+        set_report_store_factory(None)
+        set_trace_store_factory(None)
+        set_agent_factory(None)
+
+    events = _parse_sse_events(body)
+    # The ping is emitted as a data-only SSE message with no `event:` line, so
+    # its parsed event name is None and its data carries event=="ping".
+    pings = [
+        e for e in events if e["event"] is None and e["data"].get("event") == "ping"
+    ]
+    assert pings, "expected at least one heartbeat ping before the first step"
+    # The stream still terminates normally after the report.
+    kinds = [e["event"] for e in events if e["event"] is not None]
+    assert kinds[-1] == "done"
+
+
+# --------------------------------------------------------------------------- #
+# Regression: abandoned run is closed as 'truncated'; run_id threaded to
+# save_report; finish_run not double-called.
+# --------------------------------------------------------------------------- #
+def test_stream_closes_run_as_truncated_when_producer_ends_without_report(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    """A producer that yields steps then ends cleanly (no RcaReport, no
+    exception) must still close the run — as 'truncated' — so it does not linger
+    in 'running' forever. Guards against the abandoned-run leak."""
+
+    class NoReportAgent:
+        async def run(self, case):
+            yield _scripted_trace("t001")[0]  # one step, then ends
+
+    def factory(case_id, backend=None, **kw):
+        return _fake_case(case_id), NoReportAgent()
+
+    set_agent_factory(factory)
+    try:
+        with client.stream(
+            "GET", f"/rca/t001/stream?run_id={FIXED_RUN_ID}"
+        ) as resp:
+            assert resp.status_code == 200
+            resp.read()
+    finally:
+        set_agent_factory(None)
+
+    # The one step was persisted.
+    assert len(fake_trace.appended_steps) == 1
+    # Exactly one finish_run, with status 'truncated' (the abandoned-run closer
+    # in the finally block), NOT 'completed' and NOT zero calls.
+    assert len(fake_trace.finished_runs) == 1
+    assert fake_trace.finished_runs[0] == (FIXED_RUN_ID, "truncated", None)
+
+
+def test_stream_passes_run_id_to_save_report(
+    client: TestClient, fake_store: FakeReportStore
+):
+    """The report-persistence seam must thread the effective run_id so the
+    report row is linked to the incremental trace run."""
+    with client.stream(
+        "GET", f"/rca/t001/stream?run_id={FIXED_RUN_ID}"
+    ) as resp:
+        resp.read()
+    assert fake_store.saved_run_ids == [FIXED_RUN_ID]
+
+
+def test_stream_finish_run_called_exactly_once_on_normal_completion(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    """The terminal REPORT branch closes the run; the finally-block abandoned-
+    run closer must NOT double-close it (run_closed guard)."""
+    with client.stream(
+        "GET", f"/rca/t001/stream?run_id={FIXED_RUN_ID}"
+    ) as resp:
+        resp.read()
+    assert len(fake_trace.finished_runs) == 1
+    assert fake_trace.finished_runs[0][1] == "completed"
+
+
+def test_stream_finish_run_called_exactly_once_on_error(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    """The ERROR branch closes the run as 'error'; the finally closer must not
+    re-close it (would otherwise flip 'error' -> 'truncated')."""
+
+    class RaisingAgent:
+        async def run(self, case):
+            raise RuntimeError("immediate boom")
+            yield  # pragma: no cover
+
+    def factory(case_id, backend=None, **kw):
+        return _fake_case(case_id), RaisingAgent()
+
+    set_agent_factory(factory)
+    try:
+        with client.stream(
+            "GET", f"/rca/t001/stream?run_id={FIXED_RUN_ID}"
+        ) as resp:
+            resp.read()
+    finally:
+        set_agent_factory(None)
+
+    assert len(fake_trace.finished_runs) == 1
+    assert fake_trace.finished_runs[0] == (FIXED_RUN_ID, "error", None)
