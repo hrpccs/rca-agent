@@ -8,6 +8,7 @@ uses.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 from collections.abc import AsyncIterator
@@ -268,3 +269,344 @@ class TestRunEvalErrorHandling:
             agent_factory=None,
         )
         assert called == {"case_id": "t-fake-1", "backend": "parquet"}
+
+
+# --------------------------------------------------------------------------- #
+# Per-tool latency + modality breakdown (I3)
+# --------------------------------------------------------------------------- #
+class _LatencyFakeAgent:
+    """Yields tool_call -> tool_result (with a small real sleep between them so
+    the monotonic-clock latency is measurable), then reasoning + conclude +
+    report. Exercises the _drain timing pairing + the modality grouping."""
+
+    def __init__(self, case_id: str) -> None:
+        self.case_id = case_id
+
+    async def run(self, case: Case) -> AsyncIterator[Any]:  # type: ignore[override]
+        cid = self.case_id
+        yield RcaStep(
+            step_id=f"{cid}-c1",
+            case_id=cid,
+            step_kind=StepKind.TOOL_CALL,
+            tool_name="query_metrics",
+        )
+        await asyncio.sleep(0.01)
+        yield RcaStep(
+            step_id=f"{cid}-r1",
+            case_id=cid,
+            step_kind=StepKind.TOOL_RESULT,
+            tool_name="query_metrics",
+        )
+        yield RcaStep(
+            step_id=f"{cid}-think",
+            case_id=cid,
+            step_kind=StepKind.REASONING,
+            thought="analyzing",
+        )
+        yield RcaReport(
+            case_id=cid,
+            task_id=cid,
+            alert_title=f"alert for {cid}",
+            root_cause=RootCause(
+                summary="bad pod",
+                fault_type="k8s.pod_crashloop",
+                confidence=0.7,
+            ),
+            steps=[
+                RcaStep(
+                    step_id=f"{cid}-c1",
+                    case_id=cid,
+                    step_kind=StepKind.TOOL_CALL,
+                    tool_name="query_metrics",
+                ),
+            ],
+            token_usage={"total_tokens": 5},
+            status="completed",
+        )
+
+
+def _latency_factory():
+    def _factory(case_id: str, backend: str = "parquet") -> tuple[Case, _LatencyFakeAgent]:
+        return _make_case(case_id), _LatencyFakeAgent(case_id)
+
+    return _factory
+
+
+class TestPerToolLatencyAndModality:
+    async def test_tool_latencies_recorded_as_positive(self, tmp_path: Path):
+        results = await runner.run_eval(
+            cases=["t-lat-1"],
+            out_dir=str(tmp_path),
+            agent_factory=_latency_factory(),
+        )
+        m = results[0]
+        assert "tool_latencies" in m
+        lat = m["tool_latencies"]
+        assert "query_metrics" in lat
+        assert isinstance(lat["query_metrics"], float)
+        assert lat["query_metrics"] > 0.0
+
+    async def test_modality_calls_groups_by_modality(self, tmp_path: Path):
+        results = await runner.run_eval(
+            cases=["t-lat-1"],
+            out_dir=str(tmp_path),
+            agent_factory=_latency_factory(),
+        )
+        m = results[0]
+        assert "modality_calls" in m
+        # query_metrics -> "metrics" modality, one call.
+        assert m["modality_calls"].get("metrics") == 1
+
+    async def test_unknown_tool_lands_in_other_modality(self, tmp_path: Path):
+        class OtherAgent:
+            def __init__(self, case_id: str) -> None:
+                self.case_id = case_id
+
+            async def run(self, case):  # noqa: ANN001
+                cid = self.case_id
+                yield RcaStep(
+                    step_id=f"{cid}-c",
+                    case_id=cid,
+                    step_kind=StepKind.TOOL_CALL,
+                    tool_name="some_custom_tool",
+                )
+                yield RcaStep(
+                    step_id=f"{cid}-r",
+                    case_id=cid,
+                    step_kind=StepKind.TOOL_RESULT,
+                    tool_name="some_custom_tool",
+                )
+                yield RcaReport(
+                    case_id=cid,
+                    task_id=cid,
+                    alert_title=cid,
+                    root_cause=RootCause(summary="x", confidence=0.1),
+                    steps=[
+                        RcaStep(
+                            step_id=f"{cid}-c",
+                            case_id=cid,
+                            step_kind=StepKind.TOOL_CALL,
+                            tool_name="some_custom_tool",
+                        )
+                    ],
+                    token_usage={},
+                    status="completed",
+                )
+
+        def factory(case_id, backend="parquet"):
+            return _make_case(case_id), OtherAgent(case_id)
+
+        results = await runner.run_eval(
+            cases=["t-other"],
+            out_dir=str(tmp_path),
+            agent_factory=factory,
+        )
+        m = results[0]
+        assert m["modality_calls"].get("other") == 1
+        assert m["n_tool_calls"] == 1
+
+    async def test_aggregate_has_new_latency_and_modality_keys(self, tmp_path: Path):
+        await runner.run_eval(
+            cases=["t-lat-1", "t-lat-2"],
+            out_dir=str(tmp_path),
+            agent_factory=_latency_factory(),
+        )
+        summary = json.loads((tmp_path / "eval_summary.json").read_text())
+        agg = summary["aggregate"]
+        assert "avg_tool_latency_by_tool" in agg
+        assert "modality_call_share" in agg
+        assert "tool_call_p90" in agg
+        assert "query_metrics" in agg["avg_tool_latency_by_tool"]
+        assert agg["avg_tool_latency_by_tool"]["query_metrics"] > 0
+        # Both cases called query_metrics once -> metrics modality = 100% share.
+        assert agg["modality_call_share"].get("metrics") == pytest.approx(1.0)
+        assert "query_metrics" in agg["tool_call_p90"]
+
+    async def test_unpaired_tool_call_yields_no_latency_sample(self, tmp_path: Path):
+        # A TOOL_CALL with no following TOOL_RESULT must not crash _drain and
+        # must not produce a bogus (huge) latency sample.
+        class DanglingAgent:
+            def __init__(self, case_id: str) -> None:
+                self.case_id = case_id
+
+            async def run(self, case):  # noqa: ANN001
+                cid = self.case_id
+                yield RcaStep(
+                    step_id=f"{cid}-c",
+                    case_id=cid,
+                    step_kind=StepKind.TOOL_CALL,
+                    tool_name="query_logs",
+                )
+                # No matching TOOL_RESULT — agent ends directly with a report.
+                yield RcaReport(
+                    case_id=cid,
+                    task_id=cid,
+                    alert_title=cid,
+                    root_cause=RootCause(summary="x", confidence=0.1),
+                    steps=[
+                        RcaStep(
+                            step_id=f"{cid}-c",
+                            case_id=cid,
+                            step_kind=StepKind.TOOL_CALL,
+                            tool_name="query_logs",
+                        )
+                    ],
+                    token_usage={},
+                    status="completed",
+                )
+
+        def factory(case_id, backend="parquet"):
+            return _make_case(case_id), DanglingAgent(case_id)
+
+        results = await runner.run_eval(
+            cases=["t-dangling"],
+            out_dir=str(tmp_path),
+            agent_factory=factory,
+        )
+        m = results[0]
+        # The call was counted (it is a TOOL_CALL step in the report) ...
+        assert m["n_tool_calls"] == 1
+        assert m["tool_calls"].get("query_logs") == 1
+        # ... but produced no latency sample (no result to time against).
+        assert m["tool_latencies"] == {}
+        assert m["modality_calls"].get("logs") == 1
+
+
+class TestConcurrencyAndSample:
+    async def test_concurrency_runs_all_cases_one_aggregate(self, tmp_path: Path):
+        results = await runner.run_eval(
+            cases=["t-c1", "t-c2", "t-c3", "t-c4"],
+            out_dir=str(tmp_path),
+            agent_factory=_latency_factory(),
+            concurrency=2,
+        )
+        assert {r["case_id"] for r in results} == {"t-c1", "t-c2", "t-c3", "t-c4"}
+        assert all(r["status"] == "completed" for r in results)
+        summary = json.loads((tmp_path / "eval_summary.json").read_text())
+        assert summary["aggregate"]["n_cases"] == 4
+
+    async def test_concurrency_case_failure_does_not_cancel_siblings(self, tmp_path: Path):
+        # One factory raises; the rest succeed. Under gather, an unhandled
+        # exception would cancel siblings — _run_one_case captures it so the
+        # whole batch completes.
+        def factory(case_id, backend="parquet"):
+            if case_id == "t-boom":
+                raise RuntimeError("boom")
+            return _make_case(case_id), _LatencyFakeAgent(case_id)
+
+        results = await runner.run_eval(
+            cases=["t-ok1", "t-boom", "t-ok2"],
+            out_dir=str(tmp_path),
+            agent_factory=factory,
+            concurrency=3,
+        )
+        by_id = {r["case_id"]: r for r in results}
+        assert by_id["t-boom"]["status"] == "error"
+        assert "RuntimeError" in by_id["t-boom"]["error"]
+        assert by_id["t-ok1"]["status"] == "completed"
+        assert by_id["t-ok2"]["status"] == "completed"
+
+    async def test_sample_picks_subset_of_list_cases(
+        self, tmp_path: Path, monkeypatch
+    ):
+        all_ids = [f"t-{i}" for i in range(8)]
+        monkeypatch.setattr(runner, "list_cases", lambda: list(all_ids))
+        results = await runner.run_eval(
+            out_dir=str(tmp_path),
+            agent_factory=_latency_factory(),
+            sample=3,
+        )
+        assert len(results) == 3
+        assert {r["case_id"] for r in results}.issubset(set(all_ids))
+
+    async def test_sample_clamps_when_over_count(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(runner, "list_cases", lambda: ["t-a", "t-b"])
+        results = await runner.run_eval(
+            out_dir=str(tmp_path),
+            agent_factory=_latency_factory(),
+            sample=10,
+        )
+        # --sample 10 over only 2 cases -> returns both, no ValueError.
+        assert {r["case_id"] for r in results} == {"t-a", "t-b"}
+
+    async def test_concurrency_1_matches_sequential_output(self, tmp_path: Path):
+        # The sequential path (concurrency default 1) must still produce the
+        # full result set + the new aggregate keys.
+        results = await runner.run_eval(
+            cases=["t-s1", "t-s2"],
+            out_dir=str(tmp_path),
+            agent_factory=_latency_factory(),
+            concurrency=1,
+        )
+        assert len(results) == 2
+        summary = json.loads((tmp_path / "eval_summary.json").read_text())
+        assert summary["aggregate"]["n_cases"] == 2
+
+    async def test_duplicate_case_ids_deduped(self, tmp_path: Path):
+        # `--cases a,a` must run each case once (not twice). Without dedup the
+        # concurrent path would also race two writers on the same report.json.
+        results = await runner.run_eval(
+            cases=["t-dup", "t-dup"],
+            out_dir=str(tmp_path),
+            agent_factory=_latency_factory(),
+            concurrency=2,
+        )
+        assert len(results) == 1
+        assert results[0]["case_id"] == "t-dup"
+        # Exactly one report.json artifact (no concurrent-corruption race).
+        assert (tmp_path / "t-dup.report.json").exists()
+
+    async def test_empty_tool_name_skipped_in_latencies(self, tmp_path: Path):
+        # A malformed TOOL_CALL with an empty tool_name must NOT surface as a
+        # literal "" key in tool_latencies (it would pollute eval_summary.json
+        # and inflate the "other" modality without an attributable tool).
+        class EmptyNameAgent:
+            def __init__(self, case_id: str) -> None:
+                self.case_id = case_id
+
+            async def run(self, case):  # noqa: ANN001
+                cid = self.case_id
+                yield RcaStep(
+                    step_id=f"{cid}-c",
+                    case_id=cid,
+                    step_kind=StepKind.TOOL_CALL,
+                    tool_name="",
+                )
+                await asyncio.sleep(0.001)
+                yield RcaStep(
+                    step_id=f"{cid}-r",
+                    case_id=cid,
+                    step_kind=StepKind.TOOL_RESULT,
+                    tool_name="",
+                )
+                yield RcaReport(
+                    case_id=cid,
+                    task_id=cid,
+                    alert_title=cid,
+                    root_cause=RootCause(summary="x", confidence=0.1),
+                    steps=[
+                        RcaStep(
+                            step_id=f"{cid}-c",
+                            case_id=cid,
+                            step_kind=StepKind.TOOL_CALL,
+                            tool_name="",
+                        )
+                    ],
+                    token_usage={},
+                    status="completed",
+                )
+
+        def factory(case_id, backend="parquet"):
+            return _make_case(case_id), EmptyNameAgent(case_id)
+
+        results = await runner.run_eval(
+            cases=["t-empty"],
+            out_dir=str(tmp_path),
+            agent_factory=factory,
+        )
+        m = results[0]
+        # The call was still counted (TOOL_CALL step is in report.steps)...
+        assert m["n_tool_calls"] == 1
+        # ... but no "" key leaks into tool_latencies.
+        assert "" not in m["tool_latencies"]
+        assert m["tool_latencies"] == {}

@@ -342,7 +342,16 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     from .eval.runner import run_eval
 
     cases = args.cases.split(",") if args.cases else None
-    asyncio.run(run_eval(cases=cases, backend=args.backend, limit=args.limit))
+    asyncio.run(
+        run_eval(
+            cases=cases,
+            backend=args.backend,
+            limit=args.limit,
+            out_dir=args.out_dir,
+            concurrency=args.concurrency,
+            sample=args.sample,
+        )
+    )
     return 0
 
 
@@ -612,10 +621,37 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--no-reload", action="store_true")
     ps.set_defaults(func=_cmd_serve)
 
-    pe = sub.add_parser("eval", help="benchmark the agent over cases")
+    pe = sub.add_parser(
+        "eval",
+        help="benchmark the agent over cases",
+        description=(
+            "Run the RCA agent over a set of benchmark cases and record "
+            "structural + qualitative metrics (per-case + aggregate) to "
+            "<out-dir>/eval_summary.{json,csv}. Use --cases/--sample to scope "
+            "the run, --concurrency to run cases in parallel (capped)."
+        ),
+    )
     pe.add_argument("--cases", default=None, help="comma-separated case ids (default: all)")
     pe.add_argument("--backend", default="parquet")
     pe.add_argument("--limit", type=int, default=None)
+    pe.add_argument(
+        "--out-dir",
+        default="runs",
+        help="directory for eval_summary.{json,csv} + per-case reports (default: runs)",
+    )
+    pe.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="randomly pick N cases from the full set (ignored when --cases is given)",
+    )
+    pe.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="run N cases concurrently (default 1 = sequential). A warning is "
+        "logged for N>3 (GLM/DeepSeek gateway safety).",
+    )
     pe.set_defaults(func=_cmd_eval)
 
     return p

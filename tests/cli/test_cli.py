@@ -177,6 +177,10 @@ class TestParser:
             (["serve", "--host", "127.0.0.1", "--port", "9000", "--no-reload"], "_cmd_serve"),
             (["eval"], "_cmd_eval"),
             (["eval", "--cases", "a,b", "--backend", "parquet", "--limit", "3"], "_cmd_eval"),
+            (
+                ["eval", "--out-dir", "out", "--sample", "5", "--concurrency", "2"],
+                "_cmd_eval",
+            ),
         ],
     )
     def test_routing_selects_right_func(self, argv: list[str], func_name: str) -> None:
@@ -193,6 +197,20 @@ class TestParser:
         with pytest.raises(SystemExit) as exc:
             cli.build_parser().parse_args(["data", "t001", "not-a-modality"])
         assert exc.value.code == 2
+
+    def test_eval_flags_default_and_explicit(self) -> None:
+        # Defaults: out_dir=runs, concurrency=1, sample=None.
+        a = cli.build_parser().parse_args(["eval"])
+        assert a.out_dir == "runs"
+        assert a.concurrency == 1
+        assert a.sample is None
+        # Explicit values flow through.
+        b = cli.build_parser().parse_args(
+            ["eval", "--out-dir", "eval_out", "--concurrency", "4", "--sample", "7"]
+        )
+        assert b.out_dir == "eval_out"
+        assert b.concurrency == 4
+        assert b.sample == 7
 
 
 # --------------------------------------------------------------------------- #
@@ -393,17 +411,24 @@ class TestHeavySubcommands:
             seen["cases"] = cases
             seen["backend"] = backend
             seen["limit"] = limit
+            seen.update(kw)
             return []
 
         # run_eval is imported lazily inside _cmd_eval from rca_agent.eval.runner
         monkeypatch.setattr("rca_agent.eval.runner.run_eval", fake_run_eval)
 
         args = argparse.Namespace(
-            cases="a,b", backend="parquet", limit=3
+            cases="a,b", backend="parquet", limit=3,
+            out_dir="runs", concurrency=1, sample=None,
         )
         rc = cli._cmd_eval(args)
         assert rc == 0
-        assert seen == {"cases": ["a", "b"], "backend": "parquet", "limit": 3}
+        assert seen["cases"] == ["a", "b"]
+        assert seen["backend"] == "parquet"
+        assert seen["limit"] == 3
+        assert seen["out_dir"] == "runs"
+        assert seen["concurrency"] == 1
+        assert seen["sample"] is None
 
     def test_eval_default_args(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen: dict[str, Any] = {}
@@ -412,14 +437,23 @@ class TestHeavySubcommands:
             seen["cases"] = cases
             seen["backend"] = backend
             seen["limit"] = limit
+            seen.update(kw)
             return []
 
         monkeypatch.setattr("rca_agent.eval.runner.run_eval", fake_run_eval)
 
-        args = argparse.Namespace(cases=None, backend="parquet", limit=None)
+        args = argparse.Namespace(
+            cases=None, backend="parquet", limit=None,
+            out_dir="runs", concurrency=1, sample=None,
+        )
         rc = cli._cmd_eval(args)
         assert rc == 0
-        assert seen == {"cases": None, "backend": "parquet", "limit": None}
+        assert seen["cases"] is None
+        assert seen["backend"] == "parquet"
+        assert seen["limit"] is None
+        assert seen["out_dir"] == "runs"
+        assert seen["concurrency"] == 1
+        assert seen["sample"] is None
 
     def test_serve_invokes_uvicorn_with_expected_kwargs(
         self,
@@ -482,6 +516,152 @@ class TestHeavySubcommands:
         assert seen["case_id"] == "t_imp"
         out = capsys.readouterr().out
         assert "imported" in out and "{'logs': 5, 'metrics': 3}" in out
+
+
+# --------------------------------------------------------------------------- #
+# eval flags: --out-dir / --sample / --concurrency end-to-end via _cmd_eval
+# --------------------------------------------------------------------------- #
+class TestEvalFlags:
+    """Exercise the new eval flags through ``_cmd_eval`` itself, driving the
+    real :func:`run_eval` with an injected fake-agent factory (no LLM/DB)."""
+
+    @staticmethod
+    def _make_case(case_id: str):
+        from datetime import UTC, datetime
+
+        from rca_agent.contracts import (
+            Case,
+            Modality,
+            Task,
+            TimeWindow,
+            Topology,
+        )
+
+        tw = TimeWindow(
+            start=datetime(2026, 4, 25, 5, 18, 12, tzinfo=UTC),
+            end=datetime(2026, 4, 25, 5, 28, 12, tzinfo=UTC),
+        )
+        task = Task(
+            task_id=case_id,
+            alert_title=f"alert {case_id}",
+            alert_window=tw,
+            prompt_text="rca",
+            available_modalities=[Modality.METRICS],
+        )
+        return Case(task=task, topology=Topology(case_id=case_id, window=tw), case_dir="/tmp/fake")
+
+    def _fake_factory(self):
+        from rca_agent.contracts import RcaReport, RcaStep, RootCause, StepKind
+
+        def factory(case_id: str, backend: str = "parquet"):
+            case = self._make_case(case_id)
+
+            class Agent:
+                async def run(self, case):  # noqa: ANN001
+                    yield RcaStep(
+                        step_id=f"{case_id}-c1",
+                        case_id=case_id,
+                        step_kind=StepKind.TOOL_CALL,
+                        tool_name="query_metrics",
+                    )
+                    yield RcaStep(
+                        step_id=f"{case_id}-r1",
+                        case_id=case_id,
+                        step_kind=StepKind.TOOL_RESULT,
+                        tool_name="query_metrics",
+                    )
+                    yield RcaReport(
+                        case_id=case_id,
+                        task_id=case_id,
+                        alert_title=f"alert {case_id}",
+                        status="completed",
+                        root_cause=RootCause(
+                            confidence=0.5, fault_type="latency", summary="x"
+                        ),
+                        steps=[],
+                        token_usage={"total_tokens": 1},
+                    )
+
+            return case, Agent()
+
+        return factory
+
+    def test_out_dir_flag_writes_to_given_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import rca_agent.eval.runner as runner_mod
+
+        monkeypatch.setattr(runner_mod, "_default_factory", self._fake_factory())
+        out = tmp_path / "myruns"
+        rc = cli._cmd_eval(
+            argparse.Namespace(
+                cases="t-a",
+                backend="parquet",
+                limit=None,
+                out_dir=str(out),
+                concurrency=1,
+                sample=None,
+            )
+        )
+        assert rc == 0
+        assert (out / "eval_summary.json").exists()
+        summary = json.loads((out / "eval_summary.json").read_text())
+        assert summary["aggregate"]["n_cases"] == 1
+
+    def test_sample_flag_picks_subset_of_list_cases(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        import rca_agent.eval.runner as runner_mod
+
+        all_ids = [f"t-{i}" for i in range(10)]
+        monkeypatch.setattr(runner_mod, "list_cases", lambda: list(all_ids))
+        monkeypatch.setattr(runner_mod, "_default_factory", self._fake_factory())
+        out = tmp_path / "runs"
+
+        rc = cli._cmd_eval(
+            argparse.Namespace(
+                cases=None,
+                backend="parquet",
+                limit=None,
+                out_dir=str(out),
+                concurrency=1,
+                sample=3,
+            )
+        )
+        assert rc == 0
+        # The real run_eval ran the sampled subset; the summary covers exactly
+        # 3 distinct cases drawn from the 10 available.
+        summary = json.loads((out / "eval_summary.json").read_text())
+        case_ids = {r["case_id"] for r in summary["results"]}
+        assert len(case_ids) == 3
+        assert case_ids.issubset(set(all_ids))
+
+    def test_concurrency_flag_runs_all_cases_and_one_aggregate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        import rca_agent.eval.runner as runner_mod
+
+        monkeypatch.setattr(runner_mod, "_default_factory", self._fake_factory())
+        out = tmp_path / "conc"
+        rc = cli._cmd_eval(
+            argparse.Namespace(
+                cases="t-1,t-2,t-3,t-4",
+                backend="parquet",
+                limit=None,
+                out_dir=str(out),
+                concurrency=2,
+                sample=None,
+            )
+        )
+        assert rc == 0
+        summary = json.loads((out / "eval_summary.json").read_text())
+        # One aggregate covers all 4 cases (no per-concurrency clobbering).
+        assert summary["aggregate"]["n_cases"] == 4
+        assert {r["case_id"] for r in summary["results"]} == {"t-1", "t-2", "t-3", "t-4"}
 
 
 # --------------------------------------------------------------------------- #
