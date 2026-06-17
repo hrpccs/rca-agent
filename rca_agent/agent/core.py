@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -43,6 +44,32 @@ GLOBAL = "__global__"
 _SEED_DIR = Path(__file__).resolve().parents[2] / "memory" / "seed"
 
 logger = logging.getLogger(__name__)
+
+# I2 — force-conclude fallback at the step cap.
+# When the ReAct loop exhausts ``max_steps`` without the model emitting a final
+# answer, we make ONE extra forced-conclusion LLM call to recover a best-effort
+# root cause instead of yielding a placeholder summary + confidence 0.0 (which
+# the 8-case eval showed burning 768K tokens for zero usable output). The gate
+# defaults ON (``"1"``) but can be turned OFF (``"0"``) to restore the exact
+# prior truncation behavior — fully reversible. Parsed via the same
+# ``os.environ.get`` idiom used elsewhere (cli.py, deepseek_client.py); NOT a
+# config.py field so the frozen config surface is untouched.
+_FORCE_CONCLUDE_ENV = "RCA_FORCE_CONCLUDE"
+
+
+def _force_conclude_enabled() -> bool:
+    """Read ``RCA_FORCE_CONCLUDE``; default ON, falsy values disable.
+
+    A value is OFF when it is empty or one of ``0``/``0.0``/``false``/``no``/
+    ``off``/``disable``/``disabled`` (case-insensitive). Numeric-zero spellings
+    are accepted because sibling knobs (``RCA_LLM_MAX_RETRIES``,
+    ``RCA_MEMORY_MAX_PER_BUCKET``) are numeric, so an operator may reasonably
+    write ``RCA_FORCE_CONCLUDE=0.0``. Anything else enables recovery — the
+    safer default for a root-cause agent (an unset/typo'd env var still
+    recovers a best-effort answer instead of truncating to nothing).
+    """
+    raw = os.environ.get(_FORCE_CONCLUDE_ENV, "1").strip().lower()
+    return raw not in {"0", "0.0", "false", "no", "off", "disable", "disabled", ""}
 
 # Non-fatal failures from pluggable collaborators (memory backends, OTel
 # exporters) that must never kill the ReAct loop. Kept broad on purpose: a
@@ -372,15 +399,146 @@ class RcaAgent:
 
             msgs = self.cm.assemble_turn(state)
 
-        # Out of steps — emit a truncated report.
+        # Out of steps without a final conclusion. I2: attempt a force-conclude
+        # recovery so the run returns a usable root cause instead of a
+        # placeholder + confidence 0.0 (the 8-case eval showed this path burning
+        # 768K tokens for no useful output). Env-gated; when OFF we preserve the
+        # exact prior behavior (placeholder summary, confidence 0.0, no extra
+        # LLM call) so the change is fully reversible.
+        if _force_conclude_enabled():
+            # ``tools=None`` FORBIDS tool calls — at the cap the model has no
+            # budget left to investigate further, so we want a direct answer
+            # rather than another tool_call we'd have to ignore. thinking stays
+            # enabled so the model can still reason over the evidence gathered.
+            # The final-answer JSON shape is already in the system prompt
+            # (assembled at the top of run()), so we only point at it here
+            # instead of re-emitting the whole guidance block (saves ~600 tokens
+            # on every forced call — this path exists to cut token waste).
+            force_msg = (
+                "你已达到本轮调查的步数上限（max_steps），不能再调用任何工具。\n"
+                "请基于目前已收集的证据，立刻给出你**最可能**的单一根因结论。\n"
+                "即使证据不完整，也必须按系统提示末尾的 final-answer guidance 输出一个结构化的 "
+                "```json 最终答案（而不是继续调查）。\n\n"
+                "You have reached the investigation step budget (max_steps). You MUST NOT call "
+                "any more tools. Based on the evidence gathered so far, output your SINGLE best "
+                "root-cause hypothesis now as a structured final answer — a single ```json block "
+                "in EXACTLY the shape defined in the final-answer guidance at the end of the "
+                "system prompt. If evidence is incomplete, state the gap and give the most likely "
+                "hypothesis with a suitably low confidence — do NOT keep investigating."
+            )
+            forced_msgs = self.cm.assemble_turn(state, new_user=force_msg)
+
+            rc: RootCause | None = None
+            try:
+                req = LLMRequest(
+                    messages=forced_msgs,
+                    tools=None,
+                    model=self.model,
+                    reasoning_effort=self.settings.reasoning_effort,
+                    thinking_enabled=True,
+                    max_tokens=self.settings.llm_max_tokens,
+                )
+                content, _reasoning, tool_calls, usage = await self.llm.complete(req)
+                _accum_usage(usage)
+                # A well-behaved model returns no tool_calls here (tools=None),
+                # but some backends echo prior tool_calls — we only consume text.
+                if tool_calls:
+                    logger.warning(
+                        "force-conclude call returned tool_calls despite tools=None; "
+                        "ignoring (case %s)",
+                        case_id,
+                        extra={"component": "agent", "case_id": case_id},
+                    )
+                parsed = parse_root_cause(content)
+                # Accept the parsed answer ONLY if it carries a real hypothesis:
+                # a non-empty summary AND confidence > 0. parse_root_cause's own
+                # fallbacks return either an empty/whitespace summary (strategy
+                # 4 on whitespace input) or the "(空结论 / empty conclusion)"
+                # placeholder at confidence 0.0 (strategy on None/empty input)
+                # — both mean "the model gave us nothing", so we fall through to
+                # the heuristic rather than ship a 0.0-confidence placeholder as
+                # if it were a recovered answer. (A genuine model answer always
+                # asserts confidence > 0, even if low.)
+                if (parsed.summary or "").strip() and parsed.confidence > 0.0:
+                    rc = parsed
+            except _NONFATAL_EXC as e:
+                logger.warning(
+                    "force-conclude LLM call failed (%s: %s) for case %s; "
+                    "using heuristic fallback",
+                    type(e).__name__, e, case_id,
+                    extra={"component": "agent", "case_id": case_id, "error": str(e)},
+                )
+            except Exception as e:  # noqa: BLE001 — pluggable LLM; must not kill recovery
+                logger.warning(
+                    "force-conclude LLM call raised unexpected %s for case %s; "
+                    "using heuristic fallback: %s",
+                    type(e).__name__, case_id, e,
+                    extra={"component": "agent", "case_id": case_id, "error": str(e)},
+                )
+
+            if rc is None:
+                # Heuristic fallback: synthesize from the last REASONING
+                # thought so the trace at least shows the agent's working
+                # hypothesis. Confidence is clamped LOW (0.3) because this path
+                # means we could NOT get a clean answer — callers must not treat
+                # it as high conviction. Matches parse_root_cause's own
+                # prose-fallback level. Skip the display-only memory step (its
+                # thought starts with "memory:" — see run() above) so telemetry
+                # text is never surfaced as the root-cause hypothesis.
+                last_thought = ""
+                for s in reversed(steps):
+                    if (
+                        s.step_kind == StepKind.REASONING
+                        and (s.thought or "").strip()
+                        and not (s.thought or "").startswith("memory:")
+                    ):
+                        last_thought = s.thought.strip()
+                        break
+                rc = RootCause(
+                    summary=last_thought[:800]
+                    or "(达到步数上限且未能形成假设 / "
+                    "step cap reached and no hypothesis could be formed)",
+                    confidence=0.3,
+                )
+
+            # Emit exactly ONE CONCLUDE step so the trace/persisted report shows
+            # the recovery attempt regardless of which branch produced ``rc``.
+            # This block is only reachable AFTER the loop exits, so there is no
+            # risk of double-emitting a CONCLUDE (the normal conclude path
+            # ``return``s before the loop guard can fail) and no risk of
+            # looping (we make at most one extra LLM call and never re-enter).
+            entities = [
+                e.get("entity_name") or e.get("entity_id") or ""
+                for e in rc.entity_refs
+                if isinstance(e, dict)
+            ]
+            conclude_step = RcaStep(
+                step_id=self._step_id(case_id),
+                case_id=case_id,
+                step_kind=StepKind.CONCLUDE,
+                hypothesis=rc.summary,
+                confidence=rc.confidence,
+                entities=[e for e in entities if e],
+            )
+            steps.append(conclude_step)
+            yield conclude_step
+            _safe_otel("record_step", "conclude")
+        else:
+            # Env-OFF: identical to the pre-I2 truncated report. No extra LLM
+            # call, placeholder summary, confidence 0.0, no CONCLUDE step.
+            rc = RootCause(
+                summary=(
+                    "(达到步数上限仍未给出结论 / "
+                    "max steps reached without a final conclusion)"
+                ),
+                confidence=0.0,
+            )
+
         report = RcaReport(
             case_id=case_id,
             task_id=case.task.task_id,
             alert_title=case.task.alert_title,
-            root_cause=RootCause(
-                summary="(达到步数上限仍未给出结论 / max steps reached without a final conclusion)",
-                confidence=0.0,
-            ),
+            root_cause=rc,
             steps=steps,
             model=self.model,
             token_usage=usage_total or None,

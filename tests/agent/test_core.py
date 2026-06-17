@@ -134,9 +134,16 @@ async def test_agent_loop_produces_report(sample_case):
 
 
 @pytest.mark.asyncio
-async def test_agent_truncates_on_max_steps(sample_case):
-    """An LLM that always calls tools hits the step cap and yields a truncated report."""
+async def test_agent_truncates_on_max_steps(sample_case, monkeypatch):
+    """An LLM that always calls tools hits the step cap and yields a truncated report.
+
+    Pinned to ``RCA_FORCE_CONCLUDE=0`` so this still exercises the ORIGINAL
+    pre-I2 truncation path (placeholder summary, confidence 0.0, no forced
+    call). The force-conclude recovery path has its own dedicated tests below.
+    """
     from rca_agent.contracts import RcaReport
+
+    monkeypatch.setenv("RCA_FORCE_CONCLUDE", "0")
 
     class AlwaysTools(FakeLLM):
         async def complete(self, req):
@@ -152,6 +159,9 @@ async def test_agent_truncates_on_max_steps(sample_case):
     events = [e async for e in agent.run(sample_case)]
     report = [e for e in events if isinstance(e, RcaReport)]
     assert report and report[-1].status == "truncated"
+    # Env-off: the original placeholder + confidence 0.0, no forced call.
+    assert report[-1].root_cause.confidence == 0.0
+    assert agent.llm.calls == 2  # only the two budgeted loop turns
 
 
 # --------------------------------------------------------------------------- #
@@ -454,15 +464,425 @@ class _BrokenMetrics:
 def test_safe_otel_no_ops_on_missing_recorder_and_bad_import(monkeypatch):
     """_safe_otel must never raise: a missing recorder or a broken metrics
     module is swallowed with a log line and the loop is unaffected."""
-    import rca_agent.observability as _obs_pkg
-    from rca_agent.agent import core as core_mod
+    import rca_agent.observability as _obs_package
+    from rca_agent.agent import core as core_module
 
     # 1) Recorder not found on the module surface -> warning, no raise.
-    core_mod._safe_otel("this_recorder_does_not_exist", "x", y=1)
+    core_module._safe_otel("this_recorder_does_not_exist", "x", y=1)
 
     # 2) The metrics module attribute is a broken shim whose __getattr__ raises
     #    ImportError -> the deferred import inside _safe_otel fails; must not
     #    raise. monkeypatch auto-reverts the package attribute, so no manual
     #    cleanup is needed.
-    monkeypatch.setattr(_obs_pkg, "metrics", _BrokenMetrics(), raising=False)
-    core_mod._safe_otel("record_run", "completed")  # must not raise
+    monkeypatch.setattr(_obs_package, "metrics", _BrokenMetrics(), raising=False)
+    core_module._safe_otel("record_run", "completed")  # must not raise
+
+
+# --------------------------------------------------------------------------- #
+# I2: force-conclude fallback at the step cap.
+# When the ReAct loop exhausts max_steps without a final answer, the agent
+# makes ONE extra forced-conclusion LLM call (tools=None) to recover a usable
+# root cause instead of truncating to a placeholder + confidence 0.0.
+# --------------------------------------------------------------------------- #
+
+
+def _final_answer_json(summary: str, confidence: float = 0.7) -> str:
+    """A valid final-answer ```json block the parser will accept."""
+    return (
+        "```json\n"
+        + json.dumps({
+            "summary": summary,
+            "fault_type": "app.exception",
+            "entity_refs": [
+                {"entity_name": "payment", "entity_type": "apm.service",
+                 "entity_domain": "apm"},
+            ],
+            "evidence": ["query_alerts: checkout errors"],
+            "confidence": confidence,
+            "contributing_factors": [],
+            "recommended_actions": ["rollback"],
+        })
+        + "\n```"
+    )
+
+
+class _RecordingLLMBase(FakeLLM):
+    """FakeLLM that records every LLMRequest handed to it (call count + tools)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.received: list[Any] = []
+
+    async def complete(self, req):
+        self.received.append(req)
+        return await super().complete(req)
+
+
+@pytest.mark.asyncio
+async def test_force_conclude_recovers_root_cause_at_step_cap(sample_case, monkeypatch):
+    """max_steps=1 + first turn returns tool_calls -> budget exhausted on turn 1.
+    The force-conclude call returns a valid JSON final answer -> the report is
+    still `truncated` BUT carries the parsed (non-placeholder) summary and the
+    parsed confidence, and a CONCLUDE step is yielded."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    # Force-conclude is default-ON; pin it explicitly to avoid env leakage.
+    monkeypatch.setenv("RCA_FORCE_CONCLUDE", "1")
+
+    class ToolsThenForcedConclusion(_RecordingLLMBase):
+        async def complete(self, req):
+            self.calls += 1
+            self.received.append(req)
+            if self.calls == 1:
+                # First (and only budgeted) turn: a tool call exhausts max_steps=1.
+                return (
+                    "checking alerts",
+                    "I should look at the alerts first.",
+                    [{"id": "c1", "type": "function",
+                      "function": {"name": "query_alerts", "arguments": "{}"}}],
+                    {"total_tokens": 10},
+                )
+            # Forced-conclude call: a clean JSON final answer.
+            return (
+                _final_answer_json("payment charge.js rejects gold-tier tokens", 0.72),
+                "Concluding under the step budget.",
+                None,
+                {"total_tokens": 50},
+            )
+
+    llm = ToolsThenForcedConclusion()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=1,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    assert reports, "no report produced"
+    rep = reports[-1]
+    # Status stays truncated (the budget WAS exhausted) but the root cause is
+    # the recovered one, not the placeholder.
+    assert rep.status == "truncated"
+    rc = rep.root_cause
+    assert "payment" in rc.summary
+    assert "charge.js" in rc.summary
+    assert rc.confidence == pytest.approx(0.72)
+    assert rc.fault_type == "app.exception"
+
+    # Exactly one CONCLUDE step was yielded with the recovered hypothesis.
+    conclude_steps = [s for s in steps if s.step_kind == StepKind.CONCLUDE]
+    assert len(conclude_steps) == 1
+    assert conclude_steps[0].hypothesis == rc.summary
+    assert conclude_steps[0].confidence == pytest.approx(0.72)
+    assert "payment" in conclude_steps[0].entities
+
+    # The forced call must have forbidden tools (tools=None) and been made
+    # exactly once beyond the budgeted loop turn.
+    assert llm.calls == 2
+    forced_req = llm.received[-1]
+    assert forced_req.tools is None
+
+    # Token usage from the forced call is accumulated into the report.
+    assert rep.token_usage is not None
+    assert rep.token_usage.get("total_tokens", 0) >= 60
+
+
+@pytest.mark.asyncio
+async def test_force_conclude_falls_back_to_heuristic_when_llm_raises(sample_case, monkeypatch):
+    """If the forced-conclude LLM call raises, the agent must still emit a
+    CONCLUDE step with a heuristic summary derived from the last REASONING
+    thought, confidence clamped low, status truncated — run() never raises."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    monkeypatch.setenv("RCA_FORCE_CONCLUDE", "1")
+
+    class ToolsThenExplodingForced(_RecordingLLMBase):
+        async def complete(self, req):
+            self.calls += 1
+            self.received.append(req)
+            if self.calls == 1:
+                return (
+                    "checking alerts",
+                    "My leading hypothesis is a payment-service token regression.",
+                    [{"id": "c1", "type": "function",
+                      "function": {"name": "query_alerts", "arguments": "{}"}}],
+                    {"total_tokens": 10},
+                )
+            # Forced-conclude call blows up — must not crash the run.
+            raise RuntimeError("LLM gateway 503")
+
+    llm = ToolsThenExplodingForced()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=1,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    assert reports, "no report produced — force-conclude exception killed the run"
+    rep = reports[-1]
+    assert rep.status == "truncated"
+
+    # A CONCLUDE step is still yielded (the recovery attempt is visible).
+    conclude_steps = [s for s in steps if s.step_kind == StepKind.CONCLUDE]
+    assert len(conclude_steps) == 1
+
+    # Heuristic summary is derived from the last REASONING thought.
+    rc = rep.root_cause
+    assert "payment-service token regression" in rc.summary
+    # Confidence clamped LOW.
+    assert rc.confidence == pytest.approx(0.3)
+
+    # The forced call was attempted exactly once (and failed).
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_force_conclude_falls_back_when_parse_yields_empty(sample_case, monkeypatch):
+    """If the forced call succeeds but parse_root_cause yields no real answer
+    (empty/whitespace content, or the empty-input placeholder at confidence 0.0),
+    the heuristic fallback kicks in at confidence 0.3 — never ship a 0.0
+    placeholder as if it were a recovered answer."""
+    from rca_agent.contracts import RcaReport
+
+    monkeypatch.setenv("RCA_FORCE_CONCLUDE", "1")
+
+    class ToolsThenBlankForced(_RecordingLLMBase):
+        async def complete(self, req):
+            self.calls += 1
+            self.received.append(req)
+            if self.calls == 1:
+                return (
+                    "checking",
+                    "leading hypothesis: DB connection saturation",
+                    [{"id": "c1", "type": "function",
+                      "function": {"name": "query_alerts", "arguments": "{}"}}],
+                    {"total_tokens": 5},
+                )
+            # Whitespace-only content -> parse_root_cause returns summary=''
+            # (content.strip()[:1500] of whitespace), confidence 0.3. The guard
+            # rejects the empty summary and routes to the heuristic.
+            return ("   \n  ", "", None, {"total_tokens": 5})
+
+    llm = ToolsThenBlankForced()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=1,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports
+    rep = reports[-1]
+    assert rep.status == "truncated"
+    # Heuristic: last reasoning thought, low confidence.
+    assert "DB connection saturation" in rep.root_cause.summary
+    assert rep.root_cause.confidence == pytest.approx(0.3)
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_force_conclude_heuristic_when_model_returns_literal_empty(sample_case, monkeypatch):
+    """A forced-conclude model reply of literal '' (not just whitespace) must
+    ALSO route to the heuristic at confidence 0.3 — parse_root_cause('') returns
+    the non-empty '(空结论...)' placeholder at confidence 0.0, which the guard
+    rejects via the confidence>0 check so it is NOT shipped as a recovered answer."""
+    from rca_agent.contracts import RcaReport
+
+    monkeypatch.setenv("RCA_FORCE_CONCLUDE", "1")
+
+    class ToolsThenEmptyString(_RecordingLLMBase):
+        async def complete(self, req):
+            self.calls += 1
+            self.received.append(req)
+            if self.calls == 1:
+                return (
+                    "checking",
+                    "leading hypothesis: redis failover lag",
+                    [{"id": "c1", "type": "function",
+                      "function": {"name": "query_alerts", "arguments": "{}"}}],
+                    {"total_tokens": 5},
+                )
+            # Literal empty string -> parse_root_cause returns the
+            # '(空结论 / empty conclusion)' placeholder at confidence 0.0.
+            return ("", "", None, {"total_tokens": 5})
+
+    llm = ToolsThenEmptyString()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=1,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports
+    rep = reports[-1]
+    assert rep.status == "truncated"
+    # Must NOT ship the parser's empty placeholder; heuristic at 0.3 instead.
+    assert "空结论" not in rep.root_cause.summary
+    assert "redis failover lag" in rep.root_cause.summary
+    assert rep.root_cause.confidence == pytest.approx(0.3)
+
+
+@pytest.mark.asyncio
+async def test_force_conclude_heuristic_skips_memory_display_step(sample_case, monkeypatch):
+    """The heuristic's 'last REASONING thought' walk must NOT pick the
+    display-only memory step (thought starts with 'memory:') as the root-cause
+    hypothesis — telemetry text must never surface as the conclusion."""
+    from rca_agent.contracts import MemoryItem, RcaReport
+
+    monkeypatch.setenv("RCA_FORCE_CONCLUDE", "1")
+
+    mem = _seeded_memory(
+        MemoryItem(
+            id="rb-1", case_id="__global__",
+            content="Runbook: checkout 5xx — check payment tokens.",
+            kind="runbook", entities=["payment"],
+        ),
+    )
+
+    class ToolsThenEmptyForced(_RecordingLLMBase):
+        async def complete(self, req):
+            self.calls += 1
+            self.received.append(req)
+            if self.calls == 1:
+                # First (only budgeted) turn: a tool call with EMPTY reasoning,
+                # so the only REASONING step in `steps` is the memory display
+                # step — which the heuristic must skip.
+                return (
+                    "checking alerts",
+                    "",
+                    [{"id": "c1", "type": "function",
+                      "function": {"name": "query_alerts", "arguments": "{}"}}],
+                    {"total_tokens": 5},
+                )
+            # Forced call yields nothing usable -> heuristic.
+            return ("", "", None, {"total_tokens": 5})
+
+    llm = ToolsThenEmptyForced()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=mem,
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), mem),
+        max_steps=1,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports
+    rep = reports[-1]
+    assert rep.status == "truncated"
+    # The memory display text MUST NOT leak into the root-cause summary.
+    assert "memory: retrieved" not in rep.root_cause.summary
+    assert "prior" not in rep.root_cause.summary
+    # Confidence still clamped low (heuristic).
+    assert rep.root_cause.confidence == pytest.approx(0.3)
+
+
+def test_force_conclude_env_parsing(monkeypatch):
+    """_force_conclude_enabled accepts the documented disable spellings
+    (incl. numeric 0.0, since sibling knobs are numeric) and defaults ON."""
+    from rca_agent.agent.core import _force_conclude_enabled
+
+    # Default ON when unset.
+    monkeypatch.delenv("RCA_FORCE_CONCLUDE", raising=False)
+    assert _force_conclude_enabled() is True
+
+    # Falsy spellings -> OFF.
+    for off in ("0", "0.0", "false", "FALSE", "no", "off", "disable", "disabled", "  "):
+        monkeypatch.setenv("RCA_FORCE_CONCLUDE", off)
+        assert _force_conclude_enabled() is False, f"{off!r} should disable"
+
+    # Anything else -> ON (safe default for a root-cause agent).
+    for on in ("1", "true", "yes", "on", "enable", "typo"):
+        monkeypatch.setenv("RCA_FORCE_CONCLUDE", on)
+        assert _force_conclude_enabled() is True, f"{on!r} should enable"
+
+
+@pytest.mark.asyncio
+async def test_force_conclude_disabled_preserves_original_truncation(sample_case, monkeypatch):
+    """RCA_FORCE_CONCLUDE=0 -> the EXACT pre-I2 behavior: placeholder summary,
+    confidence 0.0, NO extra llm.complete call beyond the budgeted loop, and
+    NO CONCLUDE step yielded. Use a recording fake LLM to assert call count."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    monkeypatch.setenv("RCA_FORCE_CONCLUDE", "0")
+
+    class AlwaysTools(_RecordingLLMBase):
+        async def complete(self, req):
+            self.calls += 1
+            self.received.append(req)
+            return (
+                "", "thinking",
+                [{"id": f"c{self.calls}", "type": "function",
+                  "function": {"name": "query_alerts", "arguments": "{}"}}],
+                {"total_tokens": 1},
+            )
+
+    llm = AlwaysTools()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=2,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    assert reports
+    rep = reports[-1]
+    assert rep.status == "truncated"
+
+    # ORIGINAL placeholder summary + confidence 0.0, verbatim.
+    assert rep.root_cause.summary == (
+        "(达到步数上限仍未给出结论 / "
+        "max steps reached without a final conclusion)"
+    )
+    assert rep.root_cause.confidence == 0.0
+
+    # No CONCLUDE step is yielded in the env-off path.
+    assert not any(s.step_kind == StepKind.CONCLUDE for s in steps)
+
+    # No extra LLM call beyond the two budgeted loop turns.
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_force_conclude_not_invoked_when_run_completes_normally(sample_case, monkeypatch):
+    """Regression: a run that concludes within the budget must NOT trigger the
+    force-conclude path — status stays `completed`, exactly one CONCLUDE, and
+    no forced call is made."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    monkeypatch.setenv("RCA_FORCE_CONCLUDE", "1")
+
+    # The base FakeLLM: tool_call turn 1, JSON final answer turn 2.
+    llm = _RecordingLLMBase()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=5,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    assert reports
+    rep = reports[-1]
+    assert rep.status == "completed"
+    assert rep.root_cause.confidence == pytest.approx(0.85)
+
+    conclude_steps = [s for s in steps if s.step_kind == StepKind.CONCLUDE]
+    assert len(conclude_steps) == 1
+
+    # Only the two budgeted turns ran — no forced third call.
+    assert llm.calls == 2
