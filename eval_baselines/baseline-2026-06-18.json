@@ -1,0 +1,202 @@
+{
+  "metadata": {
+    "date": "2026-06-18",
+    "model": "deepseek-reasoner",
+    "reasoning_effort": "high",
+    "max_steps": 25,
+    "max_tokens": 8192,
+    "backend": "parquet",
+    "git_sha": "d83ec5d",
+    "note": "initial baseline; 8-case sample (t001,t002,t004,t020,t040,t060,t080,t100)"
+  },
+  "aggregate": {
+    "n_cases": 8,
+    "n_completed": 7,
+    "n_truncated": 1,
+    "n_errors": 0,
+    "avg_confidence": 0.83,
+    "avg_steps": 91.29,
+    "avg_tool_calls": 36.86,
+    "avg_total_tokens": 562018.43,
+    "avg_entities": 3.29,
+    "avg_evidence": 5.57
+  },
+  "per_case": [
+    {
+      "case_id": "t001",
+      "status": "completed",
+      "confidence": 0.85,
+      "fault_type": "app.exception",
+      "n_entities": 4,
+      "n_evidence": 4,
+      "n_steps": 96,
+      "n_tool_calls": 38,
+      "tool_calls": {
+        "query_alerts": 2,
+        "get_topology": 2,
+        "query_metrics": 5,
+        "query_logs": 7,
+        "query_traces": 13,
+        "query_events": 2,
+        "inspect_entity": 3,
+        "store_observation": 4
+      },
+      "prompt_tokens": 152629,
+      "total_tokens": 158230
+    },
+    {
+      "case_id": "t002",
+      "status": "completed",
+      "confidence": 0.85,
+      "fault_type": "dependency.timeout",
+      "n_entities": 3,
+      "n_evidence": 4,
+      "n_steps": 49,
+      "n_tool_calls": 19,
+      "tool_calls": {
+        "query_alerts": 2,
+        "get_topology": 1,
+        "inspect_entity": 1,
+        "query_metrics": 4,
+        "query_logs": 5,
+        "query_events": 1,
+        "query_traces": 2,
+        "store_observation": 3
+      },
+      "prompt_tokens": 405474,
+      "total_tokens": 409679
+    },
+    {
+      "case_id": "t004",
+      "status": "completed",
+      "confidence": 0.75,
+      "fault_type": "dependency.timeout",
+      "n_entities": 2,
+      "n_evidence": 7,
+      "n_steps": 105,
+      "n_tool_calls": 44,
+      "tool_calls": {
+        "query_alerts": 2,
+        "get_topology": 1,
+        "store_observation": 5,
+        "query_metrics": 8,
+        "query_logs": 9,
+        "query_traces": 8,
+        "query_events": 2,
+        "inspect_entity": 9
+      },
+      "prompt_tokens": 831352,
+      "total_tokens": 839141
+    },
+    {
+      "case_id": "t020",
+      "status": "completed",
+      "confidence": 0.85,
+      "fault_type": "dependency.timeout",
+      "n_entities": 4,
+      "n_evidence": 6,
+      "n_steps": 75,
+      "n_tool_calls": 30,
+      "tool_calls": {
+        "query_alerts": 1,
+        "get_topology": 1,
+        "query_metrics": 6,
+        "query_logs": 10,
+        "query_events": 5,
+        "store_observation": 2,
+        "inspect_entity": 4,
+        "query_traces": 1
+      },
+      "prompt_tokens": 545699,
+      "total_tokens": 551302
+    },
+    {
+      "case_id": "t040",
+      "status": "completed",
+      "confidence": 0.85,
+      "fault_type": "infra.database_slow_query",
+      "n_entities": 3,
+      "n_evidence": 5,
+      "n_steps": 109,
+      "n_tool_calls": 45,
+      "tool_calls": {
+        "query_alerts": 1,
+        "get_topology": 1,
+        "query_metrics": 16,
+        "store_observation": 5,
+        "query_logs": 6,
+        "query_traces": 12,
+        "query_events": 2,
+        "inspect_entity": 2
+      },
+      "prompt_tokens": 437717,
+      "total_tokens": 448854
+    },
+    {
+      "case_id": "t060",
+      "status": "completed",
+      "confidence": 0.78,
+      "fault_type": "dependency.timeout",
+      "n_entities": 3,
+      "n_evidence": 7,
+      "n_steps": 135,
+      "n_tool_calls": 54,
+      "tool_calls": {
+        "query_alerts": 1,
+        "get_topology": 1,
+        "inspect_entity": 6,
+        "query_metrics": 19,
+        "query_logs": 6,
+        "query_events": 4,
+        "query_traces": 13,
+        "store_observation": 4
+      },
+      "prompt_tokens": 1119382,
+      "total_tokens": 1133434
+    },
+    {
+      "case_id": "t080",
+      "status": "truncated",
+      "confidence": 0.0,
+      "fault_type": null,
+      "n_entities": 0,
+      "n_evidence": 0,
+      "n_steps": 96,
+      "n_tool_calls": 35,
+      "tool_calls": {
+        "query_alerts": 2,
+        "get_topology": 1,
+        "inspect_entity": 2,
+        "query_metrics": 10,
+        "query_events": 2,
+        "query_logs": 8,
+        "query_traces": 9,
+        "store_observation": 1
+      },
+      "prompt_tokens": 762639,
+      "total_tokens": 768666
+    },
+    {
+      "case_id": "t100",
+      "status": "completed",
+      "confidence": 0.85,
+      "fault_type": "dependency.timeout",
+      "n_entities": 4,
+      "n_evidence": 6,
+      "n_steps": 70,
+      "n_tool_calls": 28,
+      "tool_calls": {
+        "query_alerts": 1,
+        "get_topology": 1,
+        "query_metrics": 2,
+        "inspect_entity": 2,
+        "query_logs": 14,
+        "query_traces": 2,
+        "query_events": 3,
+        "store_observation": 3
+      },
+      "prompt_tokens": 389004,
+      "total_tokens": 393489
+    }
+  ]
+}
