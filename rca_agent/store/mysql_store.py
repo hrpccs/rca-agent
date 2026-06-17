@@ -17,8 +17,9 @@ the server layer can degrade gracefully.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,9 +38,11 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from rca_agent.config import get_settings
-from rca_agent.contracts import RootCause, RcaReport, RcaStep
+from rca_agent.contracts import RcaReport, RcaStep, RootCause
 
 __all__ = ["MysqlStore", "StoreError"]
+
+logger = logging.getLogger(__name__)
 
 
 class StoreError(RuntimeError):
@@ -54,7 +57,7 @@ _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _json_default(o: Any) -> Any:
@@ -72,19 +75,49 @@ class MysqlStore:
     idempotently.
     """
 
-    def __init__(self, url: str | None = None) -> None:
-        self.url: str = url or get_settings().mysql_url
-        # Engine creation does NOT connect; imports stay side-effect free.
-        from sqlalchemy import create_engine
+    def __init__(
+        self,
+        url: str | None = None,
+        *,
+        engine: Engine | None = None,
+    ) -> None:
+        """Construct a store.
 
-        self._engine: Engine = create_engine(
-            self.url,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-            future=True,
-        )
+        By default the engine is built lazily from ``RCA_MYSQL_URL`` (no
+        connection is opened at import or construction time). Callers may pass
+        ``engine=`` (typically via :meth:`from_engine`) to inject a fake or
+        in-memory engine for testing — when supplied, ``url`` is ignored, no
+        real engine is created, and the ``RCA_*`` environment / ``.env`` is NOT
+        read (so a bad validated env var cannot break the inject path).
+        """
+        if engine is not None:
+            self._engine: Engine = engine
+            # No DSN was parsed for an injected engine; url stays blank.
+            self.url: str = ""
+        else:
+            self.url = url or get_settings().mysql_url
+            # Engine creation does NOT connect; imports stay side-effect free.
+            from sqlalchemy import create_engine
+
+            self._engine = create_engine(
+                self.url,
+                pool_pre_ping=True,
+                pool_recycle=3600,
+                future=True,
+            )
         self.metadata = MetaData()
         self._define_tables()
+
+    @classmethod
+    def from_engine(cls, engine: Engine) -> MysqlStore:
+        """Build a store bound to a pre-built ``engine`` (test/override seam).
+
+        The production default still constructs its engine lazily from
+        ``RCA_MYSQL_URL`` (see :meth:`__init__`); this classmethod exists so
+        tests can inject a fake/in-memory engine without touching the env or
+        opening a real connection.
+        """
+        return cls(engine=engine)
 
     # ------------------------------------------------------------------ #
     # Table definitions (mirror schema.sql exactly)
@@ -156,6 +189,11 @@ class MysqlStore:
                     if stmt:
                         conn.execute(text(stmt))
         except SQLAlchemyError as exc:  # pragma: no cover - infra dependent
+            logger.warning(
+                "ensure_schema: DB error — %s",
+                exc,
+                extra={"op": "ensure_schema", "error": str(exc)},
+            )
             raise StoreError(f"ensure_schema failed: {exc}") from exc
 
     @staticmethod
@@ -224,6 +262,34 @@ class MysqlStore:
     # ------------------------------------------------------------------ #
     # Reports
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _report_to_row(
+        report: RcaReport, run_id: str | None = None
+    ) -> dict[str, Any]:
+        """Serialize an :class:`RcaReport` to the ``rca_reports`` row dict.
+
+        The ``report_id`` is NOT set here (the caller mints a fresh UUID per
+        insert). ``root_cause`` / ``steps`` are JSON-encoded so the row can be
+        stored in ``LONGTEXT`` columns; the inverse is :meth:`_row_to_report`.
+        """
+        root_cause_json = report.root_cause.model_dump_json()
+        steps_json = json.dumps(
+            [s.model_dump(mode="json") for s in report.steps], default=_json_default
+        )
+        confidence = (
+            float(report.root_cause.confidence)
+            if report.root_cause.confidence is not None
+            else None
+        )
+        return {
+            "run_id": run_id,
+            "case_id": report.case_id,
+            "alert_title": report.alert_title,
+            "root_cause_json": root_cause_json,
+            "steps_json": steps_json,
+            "confidence": confidence,
+        }
+
     def save_report(self, report: RcaReport, run_id: str | None = None) -> str:
         """Insert a new :class:`RcaReport` row and return its ``report_id``.
 
@@ -234,30 +300,24 @@ class MysqlStore:
         Returns the ``report_id`` of the stored row.
         """
         report_id = uuid.uuid4().hex
-        root_cause_json = report.root_cause.model_dump_json()
-        steps_json = json.dumps(
-            [s.model_dump(mode="json") for s in report.steps], default=_json_default
-        )
-        confidence = (
-            float(report.root_cause.confidence)
-            if report.root_cause.confidence is not None
-            else None
-        )
+        row = self._report_to_row(report, run_id)
+        row["report_id"] = report_id
         try:
             with self._engine.begin() as conn:
-                conn.execute(
-                    self.rca_reports.insert(),
-                    {
-                        "report_id": report_id,
-                        "run_id": run_id,
-                        "case_id": report.case_id,
-                        "alert_title": report.alert_title,
-                        "root_cause_json": root_cause_json,
-                        "steps_json": steps_json,
-                        "confidence": confidence,
-                    },
-                )
+                conn.execute(self.rca_reports.insert(), row)
         except SQLAlchemyError as exc:
+            logger.warning(
+                "save_report: DB error case_id=%s run_id=%s — %s",
+                report.case_id,
+                run_id,
+                exc,
+                extra={
+                    "op": "save_report",
+                    "case_id": report.case_id,
+                    "run_id": run_id,
+                    "error": str(exc),
+                },
+            )
             raise StoreError(f"save_report failed: {exc}") from exc
         return report_id
 
@@ -271,6 +331,16 @@ class MysqlStore:
                     )
                 ).mappings().first()
         except SQLAlchemyError as exc:
+            logger.warning(
+                "get_report: DB error report_id=%s — %s",
+                report_id,
+                exc,
+                extra={
+                    "op": "get_report",
+                    "report_id": report_id,
+                    "error": str(exc),
+                },
+            )
             raise StoreError(f"get_report failed: {exc}") from exc
         if row is None:
             return None
@@ -288,6 +358,18 @@ class MysqlStore:
             with self._engine.connect() as conn:
                 rows = conn.execute(sel).mappings().all()
         except SQLAlchemyError as exc:
+            logger.warning(
+                "list_reports: DB error case_id=%s limit=%s — %s",
+                case_id,
+                limit,
+                exc,
+                extra={
+                    "op": "list_reports",
+                    "case_id": case_id,
+                    "limit": limit,
+                    "error": str(exc),
+                },
+            )
             raise StoreError(f"list_reports failed: {exc}") from exc
         return [self._row_to_report(r) for r in rows]
 
@@ -322,6 +404,18 @@ class MysqlStore:
                     },
                 )
         except SQLAlchemyError as exc:
+            logger.warning(
+                "start_run: DB error case_id=%s model=%s — %s",
+                case_id,
+                model,
+                exc,
+                extra={
+                    "op": "start_run",
+                    "case_id": case_id,
+                    "model": model,
+                    "error": str(exc),
+                },
+            )
             raise StoreError(f"start_run failed: {exc}") from exc
         return run_id
 
@@ -347,6 +441,18 @@ class MysqlStore:
                     values,
                 )
         except SQLAlchemyError as exc:
+            logger.warning(
+                "finish_run: DB error run_id=%s status=%s — %s",
+                run_id,
+                status,
+                exc,
+                extra={
+                    "op": "finish_run",
+                    "run_id": run_id,
+                    "status": status,
+                    "error": str(exc),
+                },
+            )
             raise StoreError(f"finish_run failed: {exc}") from exc
 
     # ------------------------------------------------------------------ #
@@ -377,6 +483,12 @@ class MysqlStore:
                     },
                 )
         except SQLAlchemyError as exc:
+            logger.warning(
+                "upsert_case: DB error case_id=%s — %s",
+                case_id,
+                exc,
+                extra={"op": "upsert_case", "case_id": case_id, "error": str(exc)},
+            )
             raise StoreError(f"upsert_case failed: {exc}") from exc
 
     def get_case(self, case_id: str) -> dict[str, Any] | None:
@@ -387,6 +499,12 @@ class MysqlStore:
                     self.cases.select().where(self.cases.c.case_id == case_id)
                 ).mappings().first()
         except SQLAlchemyError as exc:
+            logger.warning(
+                "get_case: DB error case_id=%s — %s",
+                case_id,
+                exc,
+                extra={"op": "get_case", "case_id": case_id, "error": str(exc)},
+            )
             raise StoreError(f"get_case failed: {exc}") from exc
         return dict(row) if row is not None else None
 
@@ -401,6 +519,12 @@ class MysqlStore:
                     self.config.select().where(self.config.c.kv_key == key)
                 ).mappings().first()
         except SQLAlchemyError as exc:
+            logger.warning(
+                "get_config: DB error key=%s — %s",
+                key,
+                exc,
+                extra={"op": "get_config", "key": key, "error": str(exc)},
+            )
             raise StoreError(f"get_config failed: {exc}") from exc
         if row is None:
             return default
@@ -428,4 +552,10 @@ class MysqlStore:
                     {"k": key, "v": stored},
                 )
         except SQLAlchemyError as exc:
+            logger.warning(
+                "set_config: DB error key=%s — %s",
+                key,
+                exc,
+                extra={"op": "set_config", "key": key, "error": str(exc)},
+            )
             raise StoreError(f"set_config failed: {exc}") from exc
