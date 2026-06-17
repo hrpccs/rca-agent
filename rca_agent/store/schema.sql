@@ -49,3 +49,21 @@ CREATE TABLE IF NOT EXISTS `config` (
                              ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`kv_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Per-step trace persistence (Unit T1). One row per RcaStep emitted during a
+-- run; ``seq`` gives monotonic per-run ordering so a dropped stream can be
+-- replayed in the exact order the agent produced it. ``payload`` stores the
+-- full RcaStep JSON so the table is forward-compatible with contract additions
+-- (no ALTER needed when RcaStep gains optional fields).
+CREATE TABLE IF NOT EXISTS `rca_steps` (
+  `step_id`    VARCHAR(96) NOT NULL,
+  `run_id`     VARCHAR(64) NOT NULL,
+  `case_id`    VARCHAR(64) NOT NULL,
+  `seq`        INT         NOT NULL,
+  `step_kind`  VARCHAR(32) NOT NULL,
+  `payload`    LONGTEXT    NOT NULL,
+  `created_at` DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`step_id`),
+  INDEX `ix_rca_steps_run_id` (`run_id`),
+  INDEX `ix_rca_steps_case_id` (`case_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
