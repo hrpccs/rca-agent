@@ -12,6 +12,7 @@ prints.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -41,15 +42,80 @@ from .prompts import build_initial_brief, parse_root_cause
 GLOBAL = "__global__"
 _SEED_DIR = Path(__file__).resolve().parents[2] / "memory" / "seed"
 
+logger = logging.getLogger(__name__)
+
+# Non-fatal failures from pluggable collaborators (memory backends, OTel
+# exporters) that must never kill the ReAct loop. Kept broad on purpose: a
+# backend can wrap arbitrary I/O, so we enumerate the realistic concrete
+# failures and fall back to a last-resort Exception guard (always logged).
+_NONFATAL_EXC: tuple[type[BaseException], ...] = (
+    OSError,
+    ValueError,
+    LookupError,
+    AttributeError,
+    TypeError,
+)
+
 
 def _safe_otel(fn_name: str, *args, **kwargs) -> None:
-    """Best-effort observability call — never let telemetry break the agent."""
+    """Best-effort observability call — never let telemetry break the agent.
+
+    OTel is a pluggable surface: the metrics module import, the named recorder
+    attribute, and the recorder call itself can each fail in isolation (exporter
+    network errors, SDK version drift, misconfiguration). We catch the specific
+    import/attribute failures up front with a structured warning so a
+    misconfiguration is diagnosable, then keep a last-resort guard on the actual
+    instrument call (logged at warning) so an exporter error can never propagate
+    into the investigation loop.
+    """
     try:
         from ..observability import metrics as _m
-
-        getattr(_m, fn_name)(*args, **kwargs)
-    except Exception:
-        pass
+    except ImportError as e:  # observability package missing/misconfigured
+        logger.warning(
+            "otel metrics import failed; disabling telemetry: %s", e,
+            extra={"component": "otel", "recorder": fn_name, "error": str(e)},
+        )
+        return
+    # getattr(..., default) does NOT suppress errors raised by a module's own
+    # ``__getattr__`` (it only supplies the default for a plain AttributeError),
+    # so guard the lookup explicitly — a broken observability shim must never
+    # leak into the ReAct loop.
+    try:
+        fn = getattr(_m, fn_name, None)
+    except _NONFATAL_EXC as e:
+        logger.warning(
+            "otel metrics lookup for %r raised %s; skipping (non-fatal): %s",
+            fn_name, type(e).__name__, e,
+            extra={"component": "otel", "recorder": fn_name, "error": str(e)},
+        )
+        return
+    except Exception as e:  # noqa: BLE001 — last-resort: telemetry must not kill the loop
+        logger.warning(
+            "otel metrics lookup for %r raised unexpected %s; skipping (non-fatal): %s",
+            fn_name, type(e).__name__, e,
+            extra={"component": "otel", "recorder": fn_name, "error": str(e)},
+        )
+        return
+    if fn is None or not callable(fn):
+        logger.warning(
+            "otel metrics recorder %r not found; skipping", fn_name,
+            extra={"component": "otel", "recorder": fn_name},
+        )
+        return
+    try:
+        fn(*args, **kwargs)
+    except _NONFATAL_EXC as e:
+        logger.warning(
+            "otel recorder %s raised %s; skipping (non-fatal): %s",
+            fn_name, type(e).__name__, e,
+            extra={"component": "otel", "recorder": fn_name, "error": str(e)},
+        )
+    except Exception as e:  # noqa: BLE001 — last-resort: telemetry must not kill the loop
+        logger.warning(
+            "otel recorder %s raised unexpected %s; skipping (non-fatal): %s",
+            fn_name, type(e).__name__, e,
+            extra={"component": "otel", "recorder": fn_name, "error": str(e)},
+        )
 
 
 class RcaAgent:
@@ -91,10 +157,24 @@ class RcaAgent:
         state = self.cm.init(case_id, system)
 
         # Seed the agent's context with relevant prior knowledge, if any.
+        # A memory-backend failure (corrupt store, bad retriever, etc.) must
+        # never abort the investigation — the agent proceeds without priors.
         hits: list[Any] = []
         try:
             hits = self.memory.retrieve_for_context(GLOBAL, case.task.alert_title, top_k=6)
-        except Exception:
+        except _NONFATAL_EXC as e:
+            logger.warning(
+                "memory retrieve_for_context failed for case %s; proceeding without priors (%s: %s)",
+                case_id, type(e).__name__, e,
+                extra={"component": "memory", "case_id": case_id, "error": str(e)},
+            )
+            hits = []
+        except Exception as e:  # noqa: BLE001 — pluggable backend; never fatal
+            logger.warning(
+                "memory retrieve_for_context raised unexpected %s for case %s; proceeding without priors: %s",
+                type(e).__name__, case_id, e,
+                extra={"component": "memory", "case_id": case_id, "error": str(e)},
+            )
             hits = []
 
         first_user = build_initial_brief(case.task, case.topology, hits)
@@ -208,6 +288,15 @@ class RcaAgent:
                 except Exception as e:  # tool failure is evidence, not a crash
                     ok = False
                     result = {"error": f"{type(e).__name__}: {e}"}
+                    logger.warning(
+                        "tool %s raised %s for case %s; surfacing as evidence: %s",
+                        name, type(e).__name__, case_id, e,
+                        extra={
+                            "component": "tool", "case_id": case_id,
+                            "tool": name, "error": str(e),
+                        },
+                        exc_info=False,
+                    )
                 _safe_otel("record_tool_call", name, "ok" if ok else "error")
 
                 text = result.get("text") if isinstance(result, dict) else None
@@ -282,7 +371,19 @@ def build_agent_for_case(
     if memory is None:
         try:
             memory = InMemoryStore.load_seed(_SEED_DIR) if _SEED_DIR.exists() else InMemoryStore()
-        except Exception:
+        except _NONFATAL_EXC as e:
+            logger.warning(
+                "memory seed load from %s failed (%s: %s); starting with empty memory",
+                _SEED_DIR, type(e).__name__, e,
+                extra={"component": "memory", "seed_dir": str(_SEED_DIR), "error": str(e)},
+            )
+            memory = InMemoryStore()
+        except Exception as e:  # noqa: BLE001 — pluggable backend; never fatal
+            logger.warning(
+                "memory seed load raised unexpected %s; starting with empty memory: %s",
+                type(e).__name__, e,
+                extra={"component": "memory", "seed_dir": str(_SEED_DIR), "error": str(e)},
+            )
             memory = InMemoryStore()
 
     agent = RcaAgent(

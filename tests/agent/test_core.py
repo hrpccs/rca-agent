@@ -152,3 +152,168 @@ async def test_agent_truncates_on_max_steps(sample_case):
     events = [e async for e in agent.run(sample_case)]
     report = [e for e in events if isinstance(e, RcaReport)]
     assert report and report[-1].status == "truncated"
+
+
+# --------------------------------------------------------------------------- #
+# Hardening: non-fatal failures must never kill the ReAct loop.
+# --------------------------------------------------------------------------- #
+
+
+class _ExplodingProvider(FakeProvider):
+    """Provider whose query_alerts blows up — used to exercise tool-handler error
+    surfacing without touching real data."""
+
+    def query_alerts(self, f):
+        raise RuntimeError("provider exploded: DB connection refused")
+
+
+class _ExplodingMemory(InMemoryStore):
+    """Memory store whose retrieve_for_context always raises — exercises that a
+    seed/prior load failure cannot abort the run."""
+
+    def retrieve_for_context(self, case_id, query, top_k=8):
+        raise OSError("memory backend unavailable")
+
+
+@pytest.mark.asyncio
+async def test_tool_handler_error_is_surfaced_and_run_continues(sample_case):
+    """A tool handler that raises must yield a tool_result describing the error,
+    and the loop must continue so the next LLM turn can still conclude."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    class ToolsThenConclude(FakeLLM):
+        async def complete(self, req):
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    "Let me check alerts.",
+                    "checking alerts",
+                    [{"id": "c1", "type": "function",
+                      "function": {"name": "query_alerts", "arguments": "{}"}}],
+                    {"total_tokens": 10},
+                )
+            return (
+                "```json\n" + json.dumps({
+                    "summary": "investigated; provider error was surfaced as evidence",
+                    "fault_type": "unknown",
+                    "confidence": 0.4,
+                    "evidence": ["query_alerts raised: provider exploded"],
+                    "contributing_factors": [],
+                    "recommended_actions": [],
+                    "entity_refs": [],
+                }) + "\n```",
+                "Evidence collected (incl. the tool error); concluding.",
+                None,
+                {"total_tokens": 20},
+            )
+
+    agent = RcaAgent(
+        provider=_ExplodingProvider(),
+        llm=ToolsThenConclude(),
+        memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(_ExplodingProvider(), InMemoryStore()),
+        max_steps=4,
+    )
+
+    events = [e async for e in agent.run(sample_case)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports, "no report produced — tool error crashed the run"
+    assert reports[-1].status == "completed"
+
+    # The tool_result for query_alerts must carry the error payload.
+    tool_results = [
+        s for s in steps
+        if s.step_kind == StepKind.TOOL_RESULT and s.tool_name == "query_alerts"
+    ]
+    assert tool_results, "no tool_result emitted for the failing call"
+    res = tool_results[-1].tool_result
+    assert isinstance(res, dict) and "error" in res
+    assert "RuntimeError" in res["error"]
+    assert "provider exploded" in res["error"]
+
+    # The LLM must have been called again after the error (loop continued).
+    assert agent.llm.calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_malformed_final_answer_yields_completed_report(sample_case):
+    """When the LLM returns a non-JSON, tool-call-free final answer, the
+    parse_root_cause fallback must still yield a completed RcaReport (low/default
+    confidence) and never raise."""
+    from rca_agent.contracts import RcaReport
+
+    class GarbageFinal(FakeLLM):
+        async def complete(self, req):
+            self.calls += 1
+            # No tool_calls, no JSON — just prose. parse_root_cause must fall back.
+            return (
+                "I am not sure what is wrong; the logs look noisy and nothing"
+                " clearly points to a fault. Maybe a deploy went out.",
+                "could not converge on a single root cause",
+                None,
+                {"total_tokens": 5},
+            )
+
+    agent = RcaAgent(
+        provider=FakeProvider(),
+        llm=GarbageFinal(),
+        memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=3,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports, "no report produced — parse raised"
+    rep = reports[-1]
+    # Must complete (not truncate) with a default/low confidence — never raise.
+    assert rep.status == "completed"
+    assert rep.root_cause.confidence <= 0.5
+    assert rep.root_cause.summary  # non-empty fallback summary
+
+
+@pytest.mark.asyncio
+async def test_memory_seed_failure_does_not_crash_run(sample_case):
+    """If memory.retrieve_for_context raises at startup, the agent must still run
+    to completion using the FakeLLM's normal flow (no priors, but alive)."""
+    from rca_agent.contracts import RcaReport
+
+    agent = RcaAgent(
+        provider=FakeProvider(),
+        llm=FakeLLM(),  # tool_call turn 1, JSON final answer turn 2
+        memory=_ExplodingMemory(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), _ExplodingMemory()),
+        max_steps=4,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports, "no report produced — memory failure aborted the run"
+    assert reports[-1].status == "completed"
+    assert reports[-1].root_cause.confidence == pytest.approx(0.85)
+
+
+class _BrokenMetrics:
+    """Module shim whose every attribute lookup raises ImportError."""
+
+    def __getattr__(self, name):
+        raise ImportError("simulated broken observability")
+
+
+def test_safe_otel_no_ops_on_missing_recorder_and_bad_import(monkeypatch):
+    """_safe_otel must never raise: a missing recorder or a broken metrics
+    module is swallowed with a log line and the loop is unaffected."""
+    import rca_agent.observability as _obs_pkg
+    from rca_agent.agent import core as core_mod
+
+    # 1) Recorder not found on the module surface -> warning, no raise.
+    core_mod._safe_otel("this_recorder_does_not_exist", "x", y=1)
+
+    # 2) The metrics module attribute is a broken shim whose __getattr__ raises
+    #    ImportError -> the deferred import inside _safe_otel fails; must not
+    #    raise. monkeypatch auto-reverts the package attribute, so no manual
+    #    cleanup is needed.
+    monkeypatch.setattr(_obs_pkg, "metrics", _BrokenMetrics(), raising=False)
+    core_mod._safe_otel("record_run", "completed")  # must not raise
