@@ -17,9 +17,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _PROXY_VARS = (
     "all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY",
@@ -28,8 +31,34 @@ _PROXY_VARS = (
 
 
 def _clear_proxy_env() -> None:
-    for v in _PROXY_VARS:
-        os.environ.pop(v, None)
+    """Strip SOCKS/HTTP proxy env vars that break the openai/httpx client.
+
+    Safe to call repeatedly; missing vars are ignored. A debug line is emitted
+    so a misbehaving shell profile is easy to spot in logs.
+    """
+    removed = [v for v in _PROXY_VARS if os.environ.pop(v, None) is not None]
+    if removed:
+        logger.debug("cleared proxy env vars: %s", ", ".join(removed))
+
+
+def _configure_logging() -> None:
+    """Install a stderr handler on the root logger if none is configured.
+
+    Without this the package's ``logger.debug``/``info``/``error`` calls are
+    silently dropped (the root logger has no handlers by default), which would
+    hide both the diagnosability lines added in this module and the
+    ``exc_info=True`` traceback logged from :func:`main`'s top-level handler.
+
+    The level is taken from ``RCA_LOG_LEVEL`` (default ``INFO``) so operators
+    can opt into ``DEBUG`` without code changes. Existing handler setups
+    (e.g. uvicorn configuring logging for ``serve``) are left untouched.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    level_name = os.environ.get("RCA_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(level=level, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
 
 
 def _cmd_cases(args: argparse.Namespace) -> int:
@@ -43,18 +72,31 @@ def _cmd_cases(args: argparse.Namespace) -> int:
 
 
 def _print_step(step) -> None:
-    kind = step.step_kind.value if hasattr(step.step_kind, "value") else str(step.step_kind)
-    if kind == "reasoning":
-        print(f"\n[thought] {step.thought}"[:600], flush=True)
-    elif kind == "tool_call":
-        print(f"\n→ tool_call: {step.tool_name} {json.dumps(step.tool_args, ensure_ascii=False)}", flush=True)
-    elif kind == "tool_result":
-        txt = (step.tool_result_text or "")[:700]
-        print(f"← {step.tool_name}: {txt}", flush=True)
-    elif kind == "conclude":
-        print(f"\n[conclude] conf={step.confidence} :: {step.hypothesis}"[:800], flush=True)
-    elif kind == "error":
-        print(f"\n[error] {step.thought}", flush=True)
+    """Render one agent step to stdout.
+
+    Attribute access is defensive end-to-end: a malformed step object (missing
+    or raising ``step_kind`` *or* payload attributes like ``thought`` /
+    ``tool_args``) must not abort the whole run; the offending step is logged
+    at WARNING and skipped instead.
+    """
+    try:
+        raw_kind = getattr(step, "step_kind", None)
+        kind = raw_kind.value if hasattr(raw_kind, "value") else str(raw_kind)
+        if kind == "reasoning":
+            print(f"\n[thought] {step.thought}"[:600], flush=True)
+        elif kind == "tool_call":
+            print(f"\n→ tool_call: {step.tool_name} {json.dumps(step.tool_args, ensure_ascii=False)}", flush=True)
+        elif kind == "tool_result":
+            txt = (step.tool_result_text or "")[:700]
+            print(f"← {step.tool_name}: {txt}", flush=True)
+        elif kind == "conclude":
+            print(f"\n[conclude] conf={step.confidence} :: {step.hypothesis}"[:800], flush=True)
+        elif kind == "error":
+            print(f"\n[error] {step.thought}", flush=True)
+        else:
+            logger.debug("unhandled step_kind %s; not rendered", kind)
+    except Exception as exc:  # noqa: BLE001 — renderer must not crash the run
+        logger.warning("failed to render step: %r (%s)", step, exc)
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -76,6 +118,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     report = asyncio.run(drive())
 
     if report is None:
+        logger.warning("run produced no RcaReport for case %s", args.case)
         print("\n(no report produced)", flush=True)
         return 1
 
@@ -131,7 +174,14 @@ def _cmd_llm_ping(args: argparse.Namespace) -> int:
 
 
 def _cmd_data(args: argparse.Namespace) -> int:
-    from .contracts import AlertFilter, EventFilter, LogFilter, MetricFilter, TopologyFilter, TraceFilter
+    from .contracts import (
+        AlertFilter,
+        EventFilter,
+        LogFilter,
+        MetricFilter,
+        TopologyFilter,
+        TraceFilter,
+    )
     from .providers.parquet_provider import ParquetProvider
 
     provider = ParquetProvider.from_case(args.case)
@@ -155,7 +205,11 @@ def _cmd_data(args: argparse.Namespace) -> int:
     elif mod == "traces":
         rows = provider.query_traces(TraceFilter(window=w, service_names=[args.filter] if args.filter else None, limit=5))
         for t in rows[:5]:
-            sp = t.slowest_span()
+            try:
+                sp = t.slowest_span()
+            except Exception as exc:  # noqa: BLE001 — one bad trace must not abort the dump
+                logger.warning("trace %s: slowest_span() failed: %s", getattr(t, "trace_id", "?"), exc)
+                sp = None
             print(t.trace_id[:12], "spans:", len(t.spans), "slowest:", sp.name if sp else "-", sp.duration_ns if sp else "")
         print(f"({len(rows)} traces)")
     elif mod == "events":
@@ -178,6 +232,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
     from .providers.loader import import_case
 
     r = import_case(args.case)
+    logger.info("imported case %s: %s", args.case, r)
     print("imported:", r)
     return 0
 
@@ -248,8 +303,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     _clear_proxy_env()
+    _configure_logging()
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    # build_parser uses subparsers(required=True), so args.func is always set
+    # for any argv that survives parse_args (missing subcommand -> SystemExit 2).
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        logger.info("interrupted by user")
+        raise
+    except Exception as exc:  # noqa: BLE001 — top-level surface; preserves exit-1 behavior
+        # SystemExit (argparse / uvicorn) is a BaseException subclass, so it is
+        # NOT caught here and propagates with its original code unchanged.
+        logger.error("command %r failed: %s", getattr(args, "cmd", "?"), exc, exc_info=True)
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
