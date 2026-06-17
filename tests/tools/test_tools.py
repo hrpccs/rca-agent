@@ -354,3 +354,232 @@ def test_final_answer_guidance_covers_root_cause_fields():
                 "contributing_factors", "recommended_actions"]:
         assert key in g
     assert "entity" in g.lower()
+
+
+# --------------------------------------------------------------------------- #
+# validate_tool_call edge cases
+# --------------------------------------------------------------------------- #
+def test_validate_tool_call_malformed_json_arguments(tools):
+    """A tool call whose ``arguments`` is not a dict (e.g. a malformed JSON
+    string that failed to parse upstream) cannot even construct a ToolCall —
+    pydantic rejects it at the contract seam with ValidationError."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ToolCall(name="query_alerts", arguments="{not valid json")  # type: ignore[arg-type]
+
+
+def test_validate_tool_call_unknown_tool_name(tools):
+    """An unknown tool name surfaces as KeyError (matches the contract doc)."""
+    with pytest.raises(KeyError):
+        validate_tool_call(ToolCall(name="does_not_exist", arguments={}), tools)
+
+
+def test_validate_tool_call_missing_required_arg(tools):
+    """store_observation requires ``content``; omitting it must fail validation."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        validate_tool_call(
+            ToolCall(name="store_observation", arguments={}), tools
+        )
+
+
+def test_validate_tool_call_wrong_type_arg(tools):
+    """A clearly-wrong type for a typed field must fail validation (no silent
+    coercion of e.g. a non-numeric string to int)."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        validate_tool_call(
+            ToolCall(name="query_alerts", arguments={"limit": "definitely-not-an-int"}),
+            tools,
+        )
+
+
+def test_validate_tool_call_valid_returns_parsed_args(tools):
+    """A well-formed call returns the (tool, validated-args-model) pair with
+    defaults applied."""
+    call = ToolCall(
+        name="query_logs",
+        arguments={"pod": "checkout-abc", "contains": "OOM"},
+    )
+    tool, validated = validate_tool_call(call, tools)
+    assert tool.spec.name == "query_logs"
+    assert isinstance(validated, builtin.QueryLogsArgs)
+    assert validated.pod == "checkout-abc"
+    assert validated.contains == "OOM"
+    # default applied
+    assert validated.limit == 50
+
+
+def test_validate_tool_call_extra_unknown_args_are_ignored(tools):
+    """The current contract: args models do NOT set ``extra='forbid'``, so
+    unknown keys are silently dropped (pydantic default). Asserting the
+    documented behavior — do not change it."""
+    call = ToolCall(
+        name="query_alerts",
+        arguments={"limit": 5, "bogus_field": "should-be-ignored"},
+    )
+    tool, validated = validate_tool_call(call, tools)
+    assert tool.spec.name == "query_alerts"
+    assert validated.limit == 5
+    # the bogus key is not promoted to an attribute on the validated model
+    assert not hasattr(validated, "bogus_field")
+    assert "bogus_field" not in type(validated).model_fields
+
+
+# --------------------------------------------------------------------------- #
+# Handler error paths — a failing provider must yield a structured error RESULT
+# (not an exception), so the agent loop can keep investigating.
+# --------------------------------------------------------------------------- #
+class _ExplodingProvider(FakeProvider):
+    """Provider whose every query_* raises — simulates a backend outage."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    def query_alerts(self, f):
+        raise self._exc
+
+    def query_events(self, f):
+        raise self._exc
+
+    def query_metrics(self, f):
+        raise self._exc
+
+    def query_logs(self, f):
+        raise self._exc
+
+    def query_traces(self, f):
+        raise self._exc
+
+    def query_topology(self, f):
+        raise self._exc
+
+
+@pytest.fixture
+def boom_provider() -> _ExplodingProvider:
+    return _ExplodingProvider(RuntimeError("backend down"))
+
+
+@pytest.fixture
+def tools_boom(boom_provider, fake_memory):
+    return build_default_tools(boom_provider, fake_memory)
+
+
+def _assert_error_result(res: dict, tool_name: str) -> None:
+    """Shared shape assertions for an error-path tool result."""
+    assert res["tool"] == tool_name
+    assert res["count"] == 0
+    assert res["raw"] is None
+    # text is non-empty, mentions the tool and the failure
+    assert isinstance(res["text"], str) and res["text"]
+    assert tool_name in res["text"]
+    assert "failed" in res["text"]
+    # error carries the exception type + message
+    assert "error" in res
+    assert "RuntimeError" in res["error"]
+    assert "backend down" in res["error"]
+
+
+@pytest.mark.parametrize(
+    "name, args",
+    [
+        ("query_alerts", {"limit": 5}),
+        ("query_events", {"pod": "x"}),
+        ("query_metrics", {"service": "x"}),
+        ("query_logs", {"pod": "x"}),
+        ("query_traces", {"service": "x"}),
+        ("get_topology", {"entity_name": "x"}),
+        ("inspect_entity", {"entity_name": "x"}),
+    ],
+)
+def test_handler_returns_error_result_on_provider_failure(name, args, tools_boom, boom_provider, fake_memory):
+    """Each query handler converts a provider exception into a structured error
+    RESULT rather than raising — the agent loop must stay alive."""
+    res = _invoke(tools_boom, name, args, boom_provider, fake_memory)
+    _assert_error_result(res, name)
+
+
+def test_error_result_helper_shape():
+    """The shared error-result builder produces the canonical shape."""
+    res = builtin._error_result("query_logs", ValueError("boom"))
+    assert res == {
+        "tool": "query_logs",
+        "count": 0,
+        "text": "(query_logs failed: ValueError: boom)",
+        "raw": None,
+        "error": "ValueError: boom",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Formatter / renderer shape — canned data round-trips into structured text
+# containing the returned entities.
+# --------------------------------------------------------------------------- #
+def test_query_alerts_text_contains_entity_and_severity(provider, fake_memory, tools):
+    res = _invoke(tools, "query_alerts", {}, provider, fake_memory)
+    assert res["count"] == 1
+    txt = res["text"]
+    # entity + severity + data payload key are rendered
+    assert "checkout" in txt
+    assert "CRITICAL" in txt
+    assert "threshold" in txt  # from CloudEvent.data
+
+
+def test_query_events_text_contains_pod_and_reason(provider, fake_memory, tools):
+    res = _invoke(tools, "query_events", {}, provider, fake_memory)
+    txt = res["text"]
+    assert "checkout-abc" in txt  # pod
+    assert "BackOff" in txt  # reason
+    assert "Back-off" in txt  # message body
+
+
+def test_query_metrics_text_contains_entity_metric_and_stats(provider, fake_memory, tools):
+    res = _invoke(tools, "query_metrics", {}, provider, fake_memory)
+    txt = res["text"]
+    assert "checkout" in txt  # entity_name
+    assert "cpu_usage" in txt  # metric
+    # summary stats are rendered
+    assert "n=" in txt and "max=" in txt and "avg=" in txt
+
+
+def test_query_logs_text_contains_pod_and_content(provider, fake_memory, tools):
+    res = _invoke(tools, "query_logs", {}, provider, fake_memory)
+    txt = res["text"]
+    assert "checkout-abc" in txt  # pod
+    assert "OOMKilled" in txt  # content
+    assert "prod" in txt  # namespace
+
+
+def test_query_traces_text_contains_trace_and_spans(provider, fake_memory, tools):
+    res = _invoke(tools, "query_traces", {}, provider, fake_memory)
+    txt = res["text"]
+    assert "trace=tr1" in txt
+    assert "spans=2" in txt
+    # slowest span + error status rendered
+    assert "GET /checkout" in txt
+    assert "timeout" in txt  # status_message
+    assert "errors=1" in txt
+
+
+def test_get_topology_text_contains_entities_and_edge(provider, fake_memory, tools):
+    res = _invoke(tools, "get_topology", {}, provider, fake_memory)
+    txt = res["text"]
+    assert "entities(2)" in txt
+    assert "checkout" in txt
+    assert "postgres" in txt
+    assert "calls" in txt  # edge relation
+    assert "checkout --calls--> postgres" in txt
+
+
+def test_inspect_entity_text_contains_props_and_neighbors(provider, fake_memory, tools):
+    res = _invoke(tools, "inspect_entity", {"entity_name": "checkout"}, provider, fake_memory)
+    txt = res["text"]
+    assert "entity checkout" in txt
+    assert "props:" in txt
+    assert "lang=go" in txt  # prop from the entity dict
+    assert "neighbors(1)" in txt
+    assert "postgres" in txt  # neighbor rendered

@@ -45,6 +45,23 @@ def _cap(items: list[Any]) -> list[Any]:
     return items[:_RAW_CAP]
 
 
+def _error_result(tool_name: str, exc: BaseException) -> dict[str, Any]:
+    """Build a structured tool RESULT describing a provider/query failure.
+
+    Returning a result (rather than raising) lets the agent loop keep going and
+    feed the failure back to the LLM as normal tool evidence — a data backend
+    hiccup must not abort the whole investigation.
+    """
+    msg = f"{type(exc).__name__}: {exc}"
+    return {
+        "tool": tool_name,
+        "count": 0,
+        "text": f"({tool_name} failed: {msg})",
+        "raw": None,
+        "error": msg,
+    }
+
+
 def _ts(dt: Any) -> str:
     """Compact timestamp for rendering (handles None)."""
     if dt is None:
@@ -234,7 +251,10 @@ def _render_topology(sub: TopologySubgraph, max_entities: int = 60) -> str:
 # --------------------------------------------------------------------------- #
 def query_alerts(args: QueryAlertsArgs, provider: Any, memory: Any) -> dict[str, Any]:
     f = AlertFilter(window=provider.window, limit=args.limit)
-    rows: list[CloudEvent] = provider.query_alerts(f)
+    try:
+        rows: list[CloudEvent] = provider.query_alerts(f)
+    except Exception as e:  # noqa: BLE001 — provider backends raise broadly
+        return _error_result("query_alerts", e)
     text = "\n".join(_render_alert(r) for r in rows) or "(no alerts in window)"
     raw = [r.model_dump() for r in _cap(rows)]
     return {"tool": "query_alerts", "count": len(rows), "text": text, "raw": raw}
@@ -247,7 +267,10 @@ def query_events(args: QueryEventsArgs, provider: Any, memory: Any) -> dict[str,
         levels=[args.level] if args.level else None,
         limit=args.limit,
     )
-    rows: list[K8sEvent] = provider.query_events(f)
+    try:
+        rows: list[K8sEvent] = provider.query_events(f)
+    except Exception as e:  # noqa: BLE001 — provider backends raise broadly
+        return _error_result("query_events", e)
     text = "\n".join(_render_event(r) for r in rows) or "(no k8s events in window)"
     raw = [r.model_dump() for r in _cap(rows)]
     return {"tool": "query_events", "count": len(rows), "text": text, "raw": raw}
@@ -262,7 +285,10 @@ def query_metrics(args: QueryMetricsArgs, provider: Any, memory: Any) -> dict[st
         domains=[args.domain] if args.domain else None,
         limit=args.limit,
     )
-    rows: list[MetricSeries] = provider.query_metrics(f)
+    try:
+        rows: list[MetricSeries] = provider.query_metrics(f)
+    except Exception as e:  # noqa: BLE001 — provider backends raise broadly
+        return _error_result("query_metrics", e)
     text = "\n".join(_render_metric(r) for r in rows) or "(no metric series in window)"
     # raw: strip the (potentially large) points arrays; keep summary stats.
     raw = [
@@ -283,7 +309,10 @@ def query_logs(args: QueryLogsArgs, provider: Any, memory: Any) -> dict[str, Any
         level_hint=args.level_hint,
         limit=args.limit,
     )
-    rows: list[LogLine] = provider.query_logs(f)
+    try:
+        rows: list[LogLine] = provider.query_logs(f)
+    except Exception as e:  # noqa: BLE001 — provider backends raise broadly
+        return _error_result("query_logs", e)
     text = "\n".join(_render_log(r) for r in rows) or "(no logs in window)"
     raw = [{"ts": _ts(r.ts), "content": r.content} for r in _cap(rows)]
     return {"tool": "query_logs", "count": len(rows), "text": text, "raw": raw}
@@ -298,7 +327,10 @@ def query_traces(args: QueryTracesArgs, provider: Any, memory: Any) -> dict[str,
         min_duration_ns=args.min_duration_ms * 1_000_000 if args.min_duration_ms is not None else None,
         limit=args.limit,
     )
-    rows: list[Trace] = provider.query_traces(f)
+    try:
+        rows: list[Trace] = provider.query_traces(f)
+    except Exception as e:  # noqa: BLE001 — provider backends raise broadly
+        return _error_result("query_traces", e)
     text = "\n".join(_render_trace(r) for r in rows) or "(no traces in window)"
     raw = [r.model_dump() for r in _cap(rows)]
     return {"tool": "query_traces", "count": len(rows), "text": text, "raw": raw}
@@ -311,7 +343,10 @@ def get_topology(args: GetTopologyArgs, provider: Any, memory: Any) -> dict[str,
         hops=args.hops,
         limit=args.limit,
     )
-    sub: TopologySubgraph = provider.query_topology(f)
+    try:
+        sub: TopologySubgraph = provider.query_topology(f)
+    except Exception as e:  # noqa: BLE001 — provider backends raise broadly
+        return _error_result("get_topology", e)
     text = _render_topology(sub)
     return {
         "tool": "get_topology",
@@ -335,7 +370,10 @@ def inspect_entity(args: InspectEntityArgs, provider: Any, memory: Any) -> dict[
         hops=args.hops,
         limit=500,
     )
-    sub: TopologySubgraph = provider.query_topology(f)
+    try:
+        sub: TopologySubgraph = provider.query_topology(f)
+    except Exception as e:  # noqa: BLE001 — provider backends raise broadly
+        return _error_result("inspect_entity", e)
     key = args.entity_id or args.entity_name
     target = next(
         (e for e in sub.entities if e.get("id") == key or e.get("name") == key), None
