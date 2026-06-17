@@ -73,6 +73,112 @@ _RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({408, 409, 429, 500, 502, 50
 # misconfigured base / large max_retries cannot stall the agent for minutes.
 _BACKOFF_CAP_SECONDS = 8.0
 
+# Usage keys the agent's accumulator (core.py ``_accum_usage``) reads directly.
+# Every normalized usage dict is guaranteed to expose each of these at top level
+# so downstream consumers never have to know the provider's nested schema.
+_USAGE_TOP_KEYS: tuple[str, ...] = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "reasoning_tokens",
+)
+
+
+def _coerce_int(v: Any) -> int:
+    """Coerce a usage field to int; anything weird falls back to 0.
+
+    DeepSeek (and other OpenAI-compatible providers) report token counts as
+    integers, but defensive against provider drift: ``None``, missing keys,
+    floats, numeric strings, and non-finite floats (``nan``/``inf`` from a
+    buggy provider) all degrade gracefully to 0 rather than raising or
+    poisoning the accumulator with a non-finite value.
+
+    Named ``_coerce_int`` (not ``_as_int``) to avoid a symbol clash with the
+    ``None``-on-fallback ``_as_int`` in ``rca_agent/providers/parquet_provider``
+    — the two have different contracts (0-fallback vs None-fallback) and live
+    in different layers.
+    """
+    if v is None:
+        return 0
+    # Reject non-finite floats BEFORE int(): int(float('inf')) raises
+    # OverflowError and int(float('nan')) returns a nan-valued int on CPython
+    # that would silently corrupt every downstream sum in core.py.
+    if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+        return 0
+    try:
+        return int(v)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _normalize_usage(usage: Any) -> dict[str, Any]:
+    """Normalize a provider usage dict before it leaves the client.
+
+    DeepSeek-reasoner returns thinking tokens nested under
+    ``usage.completion_tokens_details.reasoning_tokens``; the agent's usage
+    accumulator (``core.py::_accum_usage``) reads a top-level ``reasoning_tokens``
+    key that DeepSeek never populates at the top level — so without this fix
+    the thinking cost is invisible and every cost figure undercounts.
+
+    This helper hoists nested ``*_details.*`` fields to top-level keys when the
+    top-level key is missing or zero, computes ``total_tokens`` from
+    ``prompt_tokens + completion_tokens`` when the provider omits it, and
+    guarantees a dict exposing ``prompt_tokens`` / ``completion_tokens`` /
+    ``total_tokens`` / ``reasoning_tokens``. The original nested
+    ``completion_tokens_details`` / ``prompt_tokens_details`` sub-dicts are
+    preserved untouched (some downstream code reads them).
+
+    Never raises: a malformed/missing usage dict degrades to a zero-filled
+    normalized dict.
+    """
+    if isinstance(usage, dict):
+        out = dict(usage)
+    elif usage is None:
+        out = {}
+    else:
+        # A pydantic model (e.g. CompletionUsage) or other object: best-effort
+        # conversion via model_dump, falling back to {}.
+        md = getattr(usage, "model_dump", None)
+        if callable(md):
+            try:
+                out = dict(md())
+            except Exception:  # noqa: BLE001 - never raise on provider drift
+                out = {}
+        else:
+            out = {}
+
+    prompt = _coerce_int(out.get("prompt_tokens"))
+    completion = _coerce_int(out.get("completion_tokens"))
+    total = _coerce_int(out.get("total_tokens"))
+    reasoning = _coerce_int(out.get("reasoning_tokens"))
+
+    # Hoist completion_tokens_details.reasoning_tokens to top-level when the
+    # top-level reasoning_tokens is missing/zero. DeepSeek puts thinking tokens
+    # here; some providers also emit accepted_tokens / rejected_tokens.
+    ctd = out.get("completion_tokens_details")
+    if isinstance(ctd, dict) and reasoning <= 0:
+        reasoning = _coerce_int(ctd.get("reasoning_tokens"))
+
+    # Hoist prompt_tokens_details.* defensively — only when the top-level field
+    # is missing/zero, so providers that populate both levels are left alone.
+    ptd = out.get("prompt_tokens_details")
+    if isinstance(ptd, dict) and prompt <= 0:
+        # Currently no top-level alias the accumulator reads for cached_tokens;
+        # keep this branch symmetric & forward-compatible but a no-op for now
+        # unless the provider nests prompt_tokens itself (defensive only).
+        prompt = _coerce_int(ptd.get("prompt_tokens"))
+
+    # Compute total_tokens from prompt+completion when missing/zero. Some
+    # providers omit total_tokens entirely on the streaming usage chunk.
+    if total <= 0:
+        total = prompt + completion
+
+    out["prompt_tokens"] = prompt
+    out["completion_tokens"] = completion
+    out["total_tokens"] = total
+    out["reasoning_tokens"] = reasoning
+    return out
+
 
 def _retry_tunables() -> tuple[int, float]:
     """Read retry knobs from the environment (with defaults).
@@ -279,10 +385,14 @@ class DeepSeekClient(LLMClient):
 
                 # Usage (if any) rides on the final chunk. Emitted AFTER any
                 # content/tool delta on the same chunk so it stays terminal.
+                # Normalized so downstream consumers (core.py _accum_usage) see
+                # top-level reasoning_tokens hoisted from the nested
+                # completion_tokens_details (DeepSeek-reasoner thinking tokens),
+                # and a computed total_tokens when the provider omits it.
                 if getattr(chunk, "usage", None) is not None:
                     yield LLMStreamDelta(
                         kind=DeltaKind.USAGE,
-                        usage=chunk.usage.model_dump(),
+                        usage=_normalize_usage(chunk.usage),
                     )
 
             yield LLMStreamDelta(kind=DeltaKind.DONE)
