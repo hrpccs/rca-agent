@@ -8,6 +8,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -49,6 +50,38 @@ class Settings(BaseSettings):
     otel_endpoint: str = "http://localhost:4317"
     otel_service_name: str = "rca-agent"
     otel_enabled: bool = True
+
+    # ------------------------------------------------------------------ #
+    # Field validators guarding env overrides.
+    #
+    # Every default value satisfies its own validator, so these never reject the
+    # documented defaults. They are intentionally narrow: only ports get a range
+    # check and only the enum-like routing knobs (data/memory backend, model,
+    # base url) get a non-empty check. ``deepseek_api_key`` is deliberately NOT
+    # validated — empty is the "live features disabled" sentinel.
+    #
+    # Behavior note: ``rca_agent.config`` builds a module-level ``settings``
+    # singleton at import time, so a bad port / blank required string in ``.env``
+    # or the shell environment now raises ``ValidationError`` at *import* (fail
+    # fast) instead of silently propagating a bad value to first use. This is
+    # intentional — a typo'd port surfaces immediately with a clear message —
+    # but it is a behavior change for deployments that previously tolerated bad
+    # config values silently.
+    # ------------------------------------------------------------------ #
+    @field_validator("clickhouse_port", "server_port")
+    @classmethod
+    def _port_in_range(cls, v: int) -> int:
+        # 1..65535 per IANA; defaults 8123 / 8000 are well within range.
+        if not 1 <= v <= 65535:
+            raise ValueError(f"port must be in 1..65535, got {v}")
+        return v
+
+    @field_validator("deepseek_base_url", "deepseek_model", "data_backend", "memory_backend")
+    @classmethod
+    def _non_empty_str(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("must be a non-empty string")
+        return v
 
     @property
     def has_llm_key(self) -> bool:
