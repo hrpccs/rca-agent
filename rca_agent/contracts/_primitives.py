@@ -6,10 +6,10 @@ non-contract module from here.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class Modality(StrEnum):
@@ -55,9 +55,8 @@ class EntityRef(BaseModel):
 
 def utcnow() -> datetime:
     """tz-aware UTC now. Use as ``Field(default_factory=utcnow)``."""
-    from datetime import timezone
 
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 __all__ = ["Modality", "Severity", "TimeWindow", "EntityRef", "utcnow"]

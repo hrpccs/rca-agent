@@ -22,13 +22,13 @@ from .provider import (
     MetricFilter,
     MetricSeries,
     Span,
-    Trace,
-    TraceFilter,
     TopologyFilter,
     TopologySubgraph,
+    Trace,
+    TraceFilter,
 )
-from .rca import RootCause, RcaReport, RcaStep, RcaTrace, StepKind
-from .streaming import SSEEvent, SSEEventKind, SSEDelta, sse_format
+from .rca import RcaReport, RcaStep, RcaTrace, RootCause, StepKind
+from .streaming import SSEDelta, SSEEvent, SSEEventKind, sse_format
 from .tools import (
     RegisteredTool,
     ToolCall,

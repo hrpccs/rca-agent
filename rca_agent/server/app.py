@@ -15,7 +15,7 @@ import logging
 import os
 import re
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Query
@@ -197,10 +197,80 @@ async def stream_rca(
 
     case, agent = _agent_factory(case_id, backend=backend)
 
+    # Keepalive: the client closes a stream that receives nothing for its idle
+    # timeout. A long DeepSeek reasoning turn can exceed that window between
+    # steps, so we emit an unnamed SSE message every few seconds of silence to
+    # prove the connection is alive — an *unnamed* (data-only) message fires the
+    # browser's onmessage, which re-arms the client's watchdog. (Named events
+    # only fire a matching addEventListener; comment pings are discarded
+    # entirely by EventSource, so neither would help.) Tunable via env.
+    heartbeat_interval = float(os.environ.get("RCA_SSE_HEARTBEAT_SEC", "15"))
+
     async def event_gen() -> AsyncIterator[dict]:
         seq = 0
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        sentinel: Any = object()
+
+        async def produce() -> None:
+            """Drain the agent into the queue so the consumer can interleave
+            heartbeats without cancelling an in-flight agent step (which
+            asyncio.wait_for on agent.__anext__ would do)."""
+            try:
+                async for ev in agent.run(case):
+                    await queue.put(ev)
+            except Exception as e:  # surface to the consumer as an error event
+                await queue.put(e)
+            finally:
+                await queue.put(sentinel)
+
+        task = asyncio.create_task(produce())
         try:
-            async for ev in agent.run(case):
+            while True:
+                try:
+                    item = await asyncio.wait_for(
+                        queue.get(), timeout=heartbeat_interval
+                    )
+                except TimeoutError:
+                    seq += 1
+                    yield {
+                        "data": json.dumps(
+                            {
+                                "event": "ping",
+                                "case_id": case_id,
+                                "data": {},
+                                "seq": seq,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "retry": 0,
+                    }
+                    continue
+                if item is sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    seq += 1
+                    logger.error(
+                        "rca_stream_error case_id=%s: %s: %s",
+                        case_id,
+                        type(item).__name__,
+                        item,
+                        extra={
+                            "case_id": case_id,
+                            "error": f"{type(item).__name__}: {item}",
+                        },
+                    )
+                    yield _sse(
+                        SSEEventKind.ERROR.value,
+                        {
+                            "event": SSEEventKind.ERROR.value,
+                            "case_id": case_id,
+                            "data": {"error": f"{type(item).__name__}: {item}"},
+                            "seq": seq,
+                        },
+                        seq,
+                    )
+                    break
+                ev = item
                 seq += 1
                 if isinstance(ev, RcaReport):
                     # Persist (best-effort); never let storage break the stream.
@@ -246,7 +316,7 @@ async def stream_rca(
                     # misbehaving/injected agent that keeps yielding after its
                     # report cannot produce duplicate REPORT+DONE events or
                     # hold the SSE connection open.
-                    return
+                    break
                 elif isinstance(ev, RcaStep):
                     yield _sse(
                         SSEEventKind.STEP.value,
@@ -258,27 +328,14 @@ async def stream_rca(
                         },
                         seq,
                     )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # surface errors to the client, then end
-            seq += 1
-            logger.error(
-                "rca_stream_error case_id=%s: %s: %s",
-                case_id,
-                type(e).__name__,
-                e,
-                extra={"case_id": case_id, "error": f"{type(e).__name__}: {e}"},
-            )
-            yield _sse(
-                SSEEventKind.ERROR.value,
-                {
-                    "event": SSEEventKind.ERROR.value,
-                    "case_id": case_id,
-                    "data": {"error": f"{type(e).__name__}: {e}"},
-                    "seq": seq,
-                },
-                seq,
-            )
+        finally:
+            if not task.done():
+                task.cancel()
+            # Await the (possibly just-cancelled) producer task to consume its
+            # CancelledError/exception so it never propagates out of the SSE
+            # generator or surfaces as an unawaited-coroutine warning.
+            with suppress(BaseException):
+                await task
 
     return EventSourceResponse(event_gen())
 

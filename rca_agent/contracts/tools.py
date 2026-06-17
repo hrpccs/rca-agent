@@ -7,7 +7,7 @@ model), so they can never drift.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 

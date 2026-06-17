@@ -8,8 +8,9 @@ backend-neutral streaming chat interface that normalizes the raw SSE into typed
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from enum import StrEnum
-from typing import Any, AsyncIterator, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 

@@ -33,7 +33,7 @@ from ..contracts import (
     build_openai_tools,
     validate_tool_call,
 )
-from ..llm.deepseek_client import DeepSeekClient, default_client
+from ..llm.deepseek_client import default_client
 from ..memory.inmemory_store import InMemoryStore
 from ..tools.prompts import SYSTEM_PROMPT, to_final_answer_guidance
 from ..tools.registry import build_default_tools
@@ -193,7 +193,7 @@ class RcaAgent:
             if not u:
                 return
             for k in usage_total:
-                try:
+                try:  # noqa: SIM105 - tolerate non-numeric usage fields
                     usage_total[k] += int(u.get(k, 0) or 0)
                 except (TypeError, ValueError):
                     pass
@@ -297,6 +297,12 @@ class RcaAgent:
                         },
                         exc_info=False,
                     )
+                # A handler may also signal failure by returning a dict carrying
+                # an "error" key (the builtin tools do this instead of raising,
+                # so the agent loop keeps investigating) — count those as errors
+                # in the tool-call metric too, not just raised exceptions.
+                if ok and isinstance(result, dict) and result.get("error"):
+                    ok = False
                 _safe_otel("record_tool_call", name, "ok" if ok else "error")
 
                 text = result.get("text") if isinstance(result, dict) else None

@@ -18,7 +18,7 @@ import logging
 import math
 import os
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +26,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..cases import load_case
-from ..contracts.dataset import Case
 from ..contracts._primitives import Modality, TimeWindow
+from ..contracts.dataset import Case
 from ..contracts.provider import (
     AlertFilter,
     CloudEvent,
@@ -38,10 +38,10 @@ from ..contracts.provider import (
     MetricFilter,
     MetricSeries,
     Span,
-    Trace,
-    TraceFilter,
     TopologyFilter,
     TopologySubgraph,
+    Trace,
+    TraceFilter,
 )
 
 __all__ = ["ParquetProvider", "render"]
@@ -162,7 +162,7 @@ def _parse_iso(v: Any) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt
 
 
@@ -220,7 +220,7 @@ class ParquetProvider:
 
     # -- construction ------------------------------------------------------- #
     @classmethod
-    def from_case(cls, case_id: str, cases_dir: str | Path | None = None) -> "ParquetProvider":
+    def from_case(cls, case_id: str, cases_dir: str | Path | None = None) -> ParquetProvider:
         return cls(load_case(case_id, cases_dir))
 
     # -- modalities --------------------------------------------------------- #
@@ -423,9 +423,12 @@ class ParquetProvider:
             if trace_ids is not None and tid not in trace_ids:
                 continue
             start_ns = _as_int(r.get("startTime"))
-            if lo_ns is not None and hi_ns is not None:
-                if start_ns is None or not (lo_ns <= start_ns < hi_ns):
-                    continue
+            if (
+                lo_ns is not None
+                and hi_ns is not None
+                and (start_ns is None or not (lo_ns <= start_ns < hi_ns))
+            ):
+                continue
             svc = _as_str(r.get("serviceName"))
             sname = _as_str(r.get("spanName"))
             sc = _as_str(r.get("statusCode"))
@@ -544,7 +547,7 @@ class ParquetProvider:
                 # fall back to time_s / timestamp(ms)
                 t_s = _as_int(r.get("time_s"))
                 if t_s is not None:
-                    ts = datetime.fromtimestamp(t_s, tz=timezone.utc)
+                    ts = datetime.fromtimestamp(t_s, tz=UTC)
             if not _in_range_dt(ts, lo, hi):
                 continue
 

@@ -34,12 +34,7 @@ MAX_PER_BUCKET_ENV = "RCA_MEMORY_MAX_PER_BUCKET"
 
 # Tiny stoplist to keep TF-IDF term frequencies meaningful for short SRE texts.
 _STOPWORDS = frozenset(
-    """
-    a an the and or but if then else of to in on at by for with without from into
-    is are was were be been being this that these those it its as not no do does
-    did may might can could should would will i you he she we they them his her
-    their our your my me us what why how when where which who whom whose
-    """.split()
+    ["a", "an", "the", "and", "or", "but", "if", "then", "else", "of", "to", "in", "on", "at", "by", "for", "with", "without", "from", "into", "is", "are", "was", "were", "be", "been", "being", "this", "that", "these", "those", "it", "its", "as", "not", "no", "do", "does", "did", "may", "might", "can", "could", "should", "would", "will", "i", "you", "he", "she", "we", "they", "them", "his", "her", "their", "our", "your", "my", "me", "us", "what", "why", "how", "when", "where", "which", "who", "whom", "whose"]
 )
 
 # Latin/alphanumeric runs OR individual CJK ideographs (so localized — incl.
@@ -268,7 +263,7 @@ class InMemoryStore:
         }
         query_tf = _term_freq(query_tokens)
         scored: list[tuple[MemoryItem, float]] = []
-        for it, toks in zip(pool, doc_tokens):
+        for it, toks in zip(pool, doc_tokens, strict=False):
             doc_tf = _term_freq(toks)
             scored.append((it, _tfidf_score(query_tf, doc_tf, idf)))
         return scored
@@ -305,7 +300,7 @@ class InMemoryStore:
     # ------------------------------------------------------------------ #
     @classmethod
     def load_seed(cls, path: str | Path,
-                  case_id: str = GLOBAL) -> "InMemoryStore":
+                  case_id: str = GLOBAL) -> InMemoryStore:
         """Build a store preloaded from markdown seed files.
 
         Each ``*.md`` file under ``path`` becomes a :class:`MemoryItem`:

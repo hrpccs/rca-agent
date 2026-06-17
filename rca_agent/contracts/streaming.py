@@ -34,7 +34,7 @@ class SSEDelta(BaseModel):
 
 # `data` is one of the structured payloads; kept as a broad union plus dict for
 # error/ping cases.
-SSEData = Union[RcaStep, RcaReport, SSEDelta, dict[str, Any]]
+SSEData = Union[RcaStep, RcaReport, SSEDelta, dict[str, Any]]  # noqa: UP007
 
 
 class SSEEvent(BaseModel):
