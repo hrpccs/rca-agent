@@ -332,13 +332,30 @@ def ensure_schema(client: "Client") -> None:
     DDL baked into this module. Either path the canonical tables exist after.
     """
     sql_file = _SCHEMA_DIR / "clickhouse_schema.sql"
+    def _split_sql_statements(text: str) -> list[str]:
+        """Split SQL into executable statements, ignoring ``--`` line comments.
+
+        A naive ``split(';')`` breaks on semicolons that appear *inside* comment
+        prose — the schema header contains "...per benchmark case; the ...", which
+        yields fragments of bare comment text ("the", "the ClickhouseProvider ...")
+        that ClickHouse rejects (``Empty query`` code 62, or a syntax error at the
+        stray word). Strip ``--`` comment lines *first* so only real statement
+        terminators remain, then drop empty fragments. Inline trailing comments
+        (``foo -- bar``) are preserved because they sit on a non-comment line and
+        ClickHouse parses them fine.
+        """
+        no_comments = "\n".join(
+            ln for ln in text.splitlines() if not ln.strip().startswith("--")
+        )
+        return [st for st in no_comments.split(";") if st.strip()]
+
     statements: list[str]
     if sql_file.exists():
         logger.info("ensure_schema: using %s", sql_file)
-        statements = [st for st in sql_file.read_text().split(";") if st.strip()]
+        statements = _split_sql_statements(sql_file.read_text())
     else:
         logger.info("ensure_schema: clickhouse_schema.sql missing, using inline DDL")
-        statements = [st for st in _CANONICAL_DDL.split(";") if st.strip()]
+        statements = _split_sql_statements(_CANONICAL_DDL)
     for st in statements:
         client.command(st)
 
