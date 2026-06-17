@@ -1,6 +1,8 @@
 """Tests for the context manager — focused on the reasoning_content invariant."""
 from __future__ import annotations
 
+import pytest
+
 from rca_agent.context.manager import (
     ContextManager,
     _stringify,
@@ -504,3 +506,339 @@ def test_compress_drops_oldest_turns():
     out = cm.compress(s, max_tokens=300)
     assert len(out.messages) < n_before, "compress did not drop any turns"
     assert out.token_estimate <= 300
+
+
+# =========================================================================== #
+# I4 — opt-in context bounding (env-gated, OFF by default)
+#
+# RCA_CONTEXT_TOOL_RESULT_MAX_CHARS  : per-tool-message content char cap
+# RCA_CONTEXT_MAX_TOOL_MESSAGES      : sliding window over tool messages
+#
+# Default behaviour MUST be byte-identical to the un-bounded output. The
+# persisted trace is recorded upstream by core.py BEFORE assembly, so these
+# caps lose nothing durable — they only bound what the LLM sees.
+# =========================================================================== #
+_I4_TOOL_VARS = (
+    "RCA_CONTEXT_TOOL_RESULT_MAX_CHARS",
+    "RCA_CONTEXT_MAX_TOOL_MESSAGES",
+)
+
+
+@pytest.fixture
+def _clean_i4_env(monkeypatch):
+    """Ensure both I4 knobs are unset for each test (default = OFF)."""
+    for v in _I4_TOOL_VARS:
+        monkeypatch.delenv(v, raising=False)
+    yield
+
+
+def _tool_call(i: int) -> dict:
+    return {
+        "id": f"c{i}",
+        "type": "function",
+        "function": {"name": "query", "arguments": "{}"},
+    }
+
+
+def _build_multi_tool_state(cm: ContextManager, n_turns: int, content_len: int = 50) -> ContextState:
+    """Build ``n_turns`` assistant(tool_calls)+tool_result pairs."""
+    s = cm.init("t001", "You are an SRE.")
+    for i in range(n_turns):
+        s = cm.append_assistant(
+            s,
+            content=f"step {i}",
+            reasoning_content=f"reason-{i}",
+            tool_calls=[_tool_call(i)],
+        )
+        s = cm.append_tool_result(
+            s,
+            [ToolMessage(
+                tool_call_id=f"c{i}",
+                name="query",
+                content="r" * content_len + f"-result-{i}",
+            )],
+        )
+    return s
+
+
+def test_i4_default_off_is_byte_identical(_clean_i4_env):
+    """With neither knob set, assemble_turn output == the un-bounded baseline."""
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=4, content_len=80)
+    msgs = cm.assemble_turn(s, new_user="final?")
+
+    # Manually reconstruct the expected un-bounded output (matches the
+    # pre-I4 assemble_turn exactly: system + every message copy + user).
+    expected: list[dict] = [{"role": "system", "content": "You are an SRE."}]
+    for m in s.messages:
+        out = dict(m)
+        if out.get("role") == "assistant" and out.get("tool_calls"):
+            out["tool_calls"] = [dict(c) for c in out["tool_calls"]]
+        expected.append(out)
+    expected.append({"role": "user", "content": "final?"})
+
+    assert msgs == expected, "default-off output diverged from baseline"
+    # No summary/truncation markers should appear.
+    blob = repr(msgs)
+    assert "[truncated" not in blob
+    assert "context window:" not in blob
+
+
+def test_i4_tool_result_max_chars_truncates_long_only(_clean_i4_env, monkeypatch):
+    """RCA_CONTEXT_TOOL_RESULT_MAX_CHARS=200 truncates long results, leaves short ones."""
+    monkeypatch.setenv("RCA_CONTEXT_TOOL_RESULT_MAX_CHARS", "200")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=2, content_len=300)  # each >200 chars
+
+    msgs = cm.assemble_turn(s)
+    tools = [m for m in msgs if m.get("role") == "tool"]
+    assert len(tools) == 2
+    for t in tools:
+        assert t["content"].startswith("r" * 200)
+        assert "…[truncated:" in t["content"]
+        assert "full text retained in the persisted trace" in t["content"]
+    # Assistant / system messages untouched.
+    asst = [m for m in msgs if m.get("role") == "assistant"]
+    assert asst and all("truncated" not in (m.get("content") or "") for m in asst)
+    assert msgs[0] == {"role": "system", "content": "You are an SRE."}
+
+
+def test_i4_tool_result_max_chars_leaves_short_results(_clean_i4_env, monkeypatch):
+    """A result under the cap is untouched."""
+    monkeypatch.setenv("RCA_CONTEXT_TOOL_RESULT_MAX_CHARS", "200")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=1, content_len=50)  # < 200 chars
+    msgs = cm.assemble_turn(s)
+    tools = [m for m in msgs if m.get("role") == "tool"]
+    assert tools
+    assert "…[truncated" not in tools[0]["content"]
+
+
+def test_i4_max_tool_messages_keeps_recent_n(_clean_i4_env, monkeypatch):
+    """RCA_CONTEXT_MAX_TOOL_MESSAGES=2 keeps the 2 newest tool messages."""
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "2")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=5, content_len=30)
+
+    msgs = cm.assemble_turn(s, new_user="go")
+    real_tools = [
+        m for m in msgs
+        if m.get("role") == "tool"
+    ]
+    assert len(real_tools) == 2, f"expected 2 retained tool msgs, got {len(real_tools)}"
+    # The KEPT ones are the most recent (result-4, result-3).
+    kept_contents = [t["content"] for t in real_tools]
+    assert any("result-4" in c for c in kept_contents)
+    assert any("result-3" in c for c in kept_contents)
+    assert not any("result-0" in c for c in kept_contents)
+    # Exactly ONE summary note present.
+    notes = [m for m in msgs if m.get("role") == "system" and "context window:" in (m.get("content") or "")]
+    assert len(notes) == 1
+    assert "context window:" in notes[0]["content"]
+    assert "3 earlier tool result" in notes[0]["content"]
+    # User message preserved at the tail.
+    assert msgs[-1] == {"role": "user", "content": "go"}
+
+
+def test_i4_max_tool_messages_no_orphaned_tool_call(_clean_i4_env, monkeypatch):
+    """Every surviving assistant tool_calls entry has its tool response present.
+
+    The OpenAI/DeepSeek contract requires an assistant message with
+    ``tool_calls`` to be followed by matching ``role:"tool"`` responses; an
+    orphaned tool_call is rejected with HTTP 400. The sliding window drops
+    whole atomic groups so this can never happen.
+    """
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "2")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=5, content_len=20)
+
+    msgs = cm.assemble_turn(s)
+    asst_with_tools = [
+        m for m in msgs if m.get("role") == "assistant" and m.get("tool_calls")
+    ]
+    # For each surviving assistant tool_call, its id must appear as a tool_call_id.
+    tool_call_ids = {
+        tc.get("id")
+        for m in asst_with_tools
+        for tc in (m.get("tool_calls") or [])
+    }
+    response_ids = {
+        m.get("tool_call_id")
+        for m in msgs
+        if m.get("role") == "tool"
+    }
+    orphans = tool_call_ids - response_ids
+    assert not orphans, f"orphaned tool_call ids (no matching tool response): {orphans}"
+    # Reasoning echo preserved on the SURVIVING assistant tool turns.
+    assert all("reasoning_content" in m for m in asst_with_tools)
+
+
+def test_i4_both_knobs_compose(_clean_i4_env, monkeypatch):
+    """Both envs set: window drops old groups AND remaining tool content is capped."""
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "2")
+    monkeypatch.setenv("RCA_CONTEXT_TOOL_RESULT_MAX_CHARS", "40")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=5, content_len=200)
+
+    msgs = cm.assemble_turn(s)
+    real_tools = [
+        m for m in msgs
+        if m.get("role") == "tool"
+    ]
+    assert len(real_tools) == 2  # window kept 2
+    # Each surviving tool content was truncated.
+    for t in real_tools:
+        assert "…[truncated:" in t["content"], "char cap not applied after window"
+    # Summary note present (from the window), NOT itself truncated (it's short).
+    notes = [m for m in msgs if m.get("role") == "system" and "context window:" in (m.get("content") or "")]
+    assert notes and "truncated" not in notes[0]["content"]
+
+
+def test_i4_garbage_env_falls_back_to_off(_clean_i4_env, monkeypatch, caplog):
+    """A non-integer env value must fall back to OFF without crashing."""
+    monkeypatch.setenv("RCA_CONTEXT_TOOL_RESULT_MAX_CHARS", "abc")
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "not-a-number")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=3, content_len=300)
+
+    msgs = cm.assemble_turn(s)
+    # No truncation / no window -> behaves as default-off.
+    blob = repr(msgs)
+    assert "[truncated" not in blob
+    assert "context window:" not in blob
+    real_tools = [m for m in msgs if m.get("role") == "tool"]
+    assert len(real_tools) == 3  # nothing dropped
+    # A warning was logged for each unparseable knob.
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    msgs_warn = " ".join(r.getMessage() for r in warnings)
+    assert "RCA_CONTEXT_TOOL_RESULT_MAX_CHARS" in msgs_warn
+    assert "RCA_CONTEXT_MAX_TOOL_MESSAGES" in msgs_warn
+
+
+def test_i4_zero_and_negative_env_means_off(_clean_i4_env, monkeypatch):
+    """0 / negative values mean OFF (no warning, no-op)."""
+    monkeypatch.setenv("RCA_CONTEXT_TOOL_RESULT_MAX_CHARS", "0")
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "-5")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=3, content_len=300)
+    msgs = cm.assemble_turn(s)
+    blob = repr(msgs)
+    assert "[truncated" not in blob
+    assert "context window:" not in blob
+
+
+def test_i4_does_not_mutate_state(_clean_i4_env, monkeypatch):
+    """Bounding affects only the assembled list, never recorded state."""
+    monkeypatch.setenv("RCA_CONTEXT_TOOL_RESULT_MAX_CHARS", "10")
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "1")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=4, content_len=100)
+
+    msgs = cm.assemble_turn(s)
+    # The recorded state.messages are untouched (full content, full count).
+    state_tools = [m for m in s.messages if m.get("role") == "tool"]
+    assert len(state_tools) == 4
+    assert all(len(t["content"]) == 100 + len("-result-X") for t in state_tools)
+    # The assembled list was bounded.
+    asm_tools = [
+        m for m in msgs
+        if m.get("role") == "tool"
+    ]
+    assert len(asm_tools) == 1  # window kept 1
+
+
+def test_i4_window_keeps_all_when_under_cap(_clean_i4_env, monkeypatch):
+    """If tool-message count <= cap, nothing is dropped (no summary note)."""
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "10")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=3, content_len=30)
+    msgs = cm.assemble_turn(s)
+    notes = [m for m in msgs if m.get("role") == "system" and "context window:" in (m.get("content") or "")]
+    assert notes == []
+    real_tools = [m for m in msgs if m.get("role") == "tool"]
+    assert len(real_tools) == 3
+
+
+def test_i4_window_preserves_system_first(_clean_i4_env, monkeypatch):
+    """The real system prompt is always index 0, even after the window drops groups."""
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "1")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=4, content_len=10)
+    msgs = cm.assemble_turn(s)
+    assert msgs[0] == {"role": "system", "content": "You are an SRE."}
+    # Exactly one real system message.
+    assert sum(
+        1 for m in msgs
+        if m.get("role") == "system" and m.get("content") == "You are an SRE."
+    ) == 1
+
+
+def test_i4_summary_note_is_system_role_not_tool(_clean_i4_env, monkeypatch):
+    """The sliding-window summary MUST be role:"system", NOT role:"tool".
+
+    Regression guard: the OpenAI/DeepSeek chat-completions contract requires
+    every role:"tool" message to reference a tool_call_id from a preceding
+    assistant tool_calls entry. A standalone role:"tool" summary with an
+    unmatched sentinel id would be rejected with HTTP 400. The note must be
+    role:"system" (matching compress()'s summary shape).
+    """
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "1")
+    cm = ContextManager()
+    s = _build_multi_tool_state(cm, n_turns=3, content_len=10)
+    msgs = cm.assemble_turn(s)
+
+    summary_notes = [
+        m for m in msgs
+        if "context window:" in (m.get("content") or "")
+    ]
+    assert summary_notes, "expected a context-window summary note"
+    note = summary_notes[0]
+    assert note["role"] == "system", (
+        f"summary note must be role:'system' (tool would be rejected); got {note['role']!r}"
+    )
+    # And NO role:"tool" message may carry the summary content.
+    tool_notes_with_summary = [
+        m for m in msgs
+        if m.get("role") == "tool" and "context window:" in (m.get("content") or "")
+    ]
+    assert not tool_notes_with_summary, "summary leaked into a role:tool message"
+
+
+def test_i4_window_with_multi_tool_calls_per_turn(_clean_i4_env, monkeypatch):
+    """An assistant turn with TWO tool_calls: dropping it drops BOTH responses."""
+    monkeypatch.setenv("RCA_CONTEXT_MAX_TOOL_MESSAGES", "1")
+    cm = ContextManager()
+    s = cm.init("t001", "sys")
+    # Turn 0: two tool calls
+    s = cm.append_assistant(
+        s, "t0", "r0",
+        tool_calls=[_tool_call(0), {"id": "c0b", "type": "function",
+                                    "function": {"name": "q", "arguments": "{}"}}],
+    )
+    s = cm.append_tool_result(s, [
+        ToolMessage(tool_call_id="c0", name="q", content="r0"),
+        ToolMessage(tool_call_id="c0b", name="q", content="r0b"),
+    ])
+    # Turn 1: one tool call (newest -> kept)
+    s = cm.append_assistant(
+        s, "t1", "r1", tool_calls=[_tool_call(1)],
+    )
+    s = cm.append_tool_result(s, [ToolMessage(tool_call_id="c1", name="q", content="r1")])
+
+    msgs = cm.assemble_turn(s)
+    real_tools = [
+        m for m in msgs
+        if m.get("role") == "tool"
+    ]
+    assert len(real_tools) == 1
+    assert real_tools[0]["tool_call_id"] == "c1"
+    # Turn 0's assistant (with c0 AND c0b) fully dropped -> no orphan tool_call.
+    asst_ids = {
+        tc.get("id")
+        for m in msgs if m.get("role") == "assistant"
+        for tc in (m.get("tool_calls") or [])
+    }
+    assert "c0" not in asst_ids and "c0b" not in asst_ids
+    # Summary notes that BOTH earlier tool results were dropped.
+    notes = [m for m in msgs if m.get("role") == "system" and "context window:" in (m.get("content") or "")]
+    assert notes and "2 earlier tool result" in notes[0]["content"]
