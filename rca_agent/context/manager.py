@@ -9,9 +9,42 @@ only in :attr:`ContextState.turns` (for UI replay) and omitted from
 
 The agent loop never touches ``reasoning_content``; it only calls the methods
 on this class.
+
+I4 — optional context bounding (env-gated, OFF by default):
+============================================================
+An 8-case evaluation found prompt tokens balloon to ~831K (max 1.13M) at
+~16K tokens/tool-call. The single biggest safe, in-scope lever is the ASSEMBLY
+path here: what gets sent to the LLM. core.py already caps each tool-result
+text at 4000 chars upstream (NOT changed here), so single results are not the
+driver — the growth is cross-turn accumulation. These knobs bound that growth
+without touching persisted state (``RcaStep.tool_result_text`` is recorded by
+core.py BEFORE assembly, so nothing is lost). Both knobs are OFF by default so
+the default output is byte-identical to today; enable them only when running
+long, high-cost cases where truncation/cost is a concern.
+
+  * ``RCA_CONTEXT_TOOL_RESULT_MAX_CHARS`` (default ``0`` = OFF/unbounded):
+    when >0, truncate each ``role:"tool"`` message's ``content`` to this many
+    chars at assembly time, appending a ``…[truncated: <K> chars; full text
+    retained in the persisted trace]`` suffix. Only affects tool messages.
+
+  * ``RCA_CONTEXT_MAX_TOOL_MESSAGES`` (default ``0`` = OFF/keep-all): when >0
+    (N), keep the most recent N tool messages and drop the older ones,
+    replacing them with a single summary note. Dropped tool messages are
+    removed as part of an ATOMIC ``[assistant(tool_calls) + trailing tool
+    responses]`` group, so dropping a tool result also drops its originating
+    assistant tool_call — this preserves the OpenAI/DeepSeek contract (an
+    assistant message carrying ``tool_calls`` MUST be followed by matching
+    ``role:"tool"`` responses; an orphaned tool_call is rejected with HTTP
+    400). The retained assistant tool turns therefore keep their
+    ``reasoning_content`` echo intact.
+
+Non-positive or unparseable env values fall back to OFF with a warning, so a
+misconfigured env var never crashes the agent loop.
 """
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any
 
 from rca_agent.contracts.context import (
@@ -22,6 +55,13 @@ from rca_agent.contracts.context import (
 
 # How many of the most-recent turns compress() will never drop.
 _MIN_RETAINED_TURNS = 4
+
+# Env knob: per-tool-result content char cap at assembly (0 = OFF/unbounded).
+_TOOL_RESULT_MAX_CHARS_ENV = "RCA_CONTEXT_TOOL_RESULT_MAX_CHARS"
+# Env knob: keep only the N most recent tool messages at assembly (0 = OFF).
+_MAX_TOOL_MESSAGES_ENV = "RCA_CONTEXT_MAX_TOOL_MESSAGES"
+
+logger = logging.getLogger(__name__)
 
 
 def estimate_tokens(text: str) -> int:
@@ -121,7 +161,22 @@ class ContextManager:
           * every assistant message with ``tool_calls`` also carries its
             ``reasoning_content`` — re-injected from ``state.turns`` if missing
             (e.g. after a partial load).
+
+        I4 bounding (env-gated, OFF by default — see module docstring):
+          * ``RCA_CONTEXT_TOOL_RESULT_MAX_CHARS`` truncates each
+            ``role:"tool"`` message's ``content``;
+          * ``RCA_CONTEXT_MAX_TOOL_MESSAGES`` keeps only the most recent N
+            tool messages, dropping older ``[assistant(tool_calls)+tool
+            responses]`` groups ATOMICALLY so no tool_call is ever orphaned.
+
+        Both knobs are read from the env on EVERY call so tests/ops can flip
+        them without re-instantiating. When both are OFF (the default) the
+        returned list is byte-identical to the un-bounded output. State is
+        never mutated — only the assembled-for-LLM list is bounded.
         """
+        tool_max_chars = _parse_positive_int_env(_TOOL_RESULT_MAX_CHARS_ENV)
+        max_tool_msgs = _parse_positive_int_env(_MAX_TOOL_MESSAGES_ENV)
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": state.system}
         ]
@@ -144,6 +199,9 @@ class ContextManager:
                     # Final belt-and-braces guarantee: a tool-bearing assistant
                     # message MUST carry the key, even if no record was found.
                     out.setdefault("reasoning_content", "")
+                    # Defensive copy of tool_calls so the truncation/drop path
+                    # below never mutates the caller's recorded state.
+                    out["tool_calls"] = [dict(c) for c in (out["tool_calls"] or [])]
                 messages.append(out)
                 asst_seen += 1
             else:
@@ -151,6 +209,15 @@ class ContextManager:
 
         if new_user is not None:
             messages.append({"role": "user", "content": new_user})
+
+        # ---- I4 bounding: only what's SENT to the LLM is bounded. ---------- #
+        # Order matters: the sliding window drops whole atomic groups (so the
+        # truncation cap, if also on, is applied AFTER the window to the
+        # remaining tool messages). Both return early when their knob is OFF.
+        if max_tool_msgs:
+            messages = _apply_tool_message_window(messages, max_tool_msgs)
+        if tool_max_chars:
+            _apply_tool_result_char_cap(messages, tool_max_chars)
         return messages
 
     # ------------------------------------------------------------------ #
@@ -394,6 +461,209 @@ def _stringify(message: dict[str, Any]) -> str:
                 elif isinstance(item, str):
                     parts.append(item)
     return " ".join(parts)
+
+
+def _parse_positive_int_env(name: str) -> int:
+    """Parse an env var as a positive int; anything else -> 0 (OFF).
+
+    Non-positive or unparseable values resolve to ``0`` = OFF, so a
+    misconfigured env var never crashes the agent loop. A warning is logged
+    only when a value was present but unparseable (NOT when it's absent or a
+    benign ``0``/``""``, to avoid noise in the default-off path).
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return 0
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "env %s=%r is not an integer; disabling context bounding knob",
+            name, raw,
+            extra={"component": "context", "knob": name, "raw": raw},
+        )
+        return 0
+    return value if value > 0 else 0
+
+
+def _apply_tool_result_char_cap(
+    messages: list[dict[str, Any]], max_chars: int
+) -> None:
+    """Truncate each ``role:"tool"`` content in-place to ``max_chars`` chars.
+
+    Mutates the assembled list only (the messages here are already fresh dicts
+    copied in ``assemble_turn``). Non-tool messages are never touched. The
+    persisted ``RcaStep.tool_result_text`` was recorded by core.py BEFORE
+    assembly, so truncation here loses nothing durable — it only bounds what
+    the LLM sees this turn.
+    """
+    trimmed_total = 0
+    trimmed_msgs = 0
+    for m in messages:
+        if m.get("role") != "tool":
+            continue
+        content = m.get("content")
+        if not isinstance(content, str) or len(content) <= max_chars:
+            continue
+        dropped = len(content) - max_chars
+        m["content"] = (
+            content[:max_chars]
+            + f"…[truncated: {dropped} chars; full text retained in the persisted trace]"
+        )
+        trimmed_total += dropped
+        trimmed_msgs += 1
+    if trimmed_msgs:
+        logger.info(
+            "context bounding: truncated %d tool message(s), %d chars total "
+            "(cap=%d); full text retained in the persisted trace",
+            trimmed_msgs, trimmed_total, max_chars,
+            extra={
+                "component": "context",
+                "knob": _TOOL_RESULT_MAX_CHARS_ENV,
+                "trimmed_msgs": trimmed_msgs,
+                "trimmed_chars": trimmed_total,
+                "cap": max_chars,
+            },
+        )
+
+
+def _apply_tool_message_window(
+    messages: list[dict[str, Any]], max_tool_msgs: int
+) -> list[dict[str, Any]]:
+    """Keep only the most recent ``max_tool_msgs`` tool messages.
+
+    Pairing invariant (OpenAI/DeepSeek contract): an assistant message
+    carrying ``tool_calls`` MUST be immediately followed by matching
+    ``role:"tool"`` responses. Dropping a tool result while keeping its
+    originating assistant ``tool_calls`` would leave a dangling reference that
+    the API rejects with HTTP 400.
+
+    Decision: drop whole ATOMIC groups. A group is ``[assistant(tool_calls) +
+    its trailing contiguous tool messages]`` (identical grouping to
+    ``compress``). We drop the OLDEST groups until the number of surviving
+    tool messages is ``<= max_tool_msgs``, then insert ONE summary note just
+    after the retained prefix. This guarantees:
+      * no orphaned tool_call (the assistant tool_call is dropped WITH its
+        responses), and
+      * retained assistant tool turns keep their ``reasoning_content`` echo
+        (they are not touched at all).
+
+    The summary note is emitted as ``role:"system"`` (NOT ``role:"tool"``):
+    the OpenAI/DeepSeek chat-completions contract requires every
+    ``role:"tool"`` message to reference a ``tool_call_id`` from a preceding
+    assistant ``tool_calls`` entry, and a standalone tool message with an
+    unmatched sentinel id would be rejected with HTTP 400. ``compress`` uses
+    the same ``role:"system"`` summary shape for the same reason. The note is
+    placed after the preserved prefix (system prompt + leading non-tool
+    context), adjacent to where the dropped tool results were.
+
+    The leading system message (and any other leading non-tool context) is
+    ALWAYS preserved: the window only ever drops ``[assistant(tool_calls) +
+    tool responses]`` groups, never the system prompt.
+    """
+    total_tools = sum(1 for m in messages if m.get("role") == "tool")
+    if total_tools <= max_tool_msgs:
+        return messages  # nothing to drop
+
+    n = len(messages)
+
+    # Locate the leading PREFIX: everything up to (but not including) the first
+    # assistant(tool_calls) group. This always includes the system message at
+    # index 0 and is preserved verbatim (the window never touches it).
+    first_tool_group_start = n
+    for i in range(n):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            first_tool_group_start = i
+            break
+    if first_tool_group_start == n:
+        return messages  # no assistant(tool_calls) groups -> nothing to drop
+
+    body = messages[first_tool_group_start:]
+
+    # Build atomic groups over the body.
+    groups: list[tuple[int, int]] = []  # (start, end_exclusive) into body
+    i = 0
+    while i < len(body):
+        m = body[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            start = i
+            j = i + 1
+            while j < len(body) and body[j].get("role") == "tool":
+                j += 1
+            groups.append((start, j))
+            i = j
+        else:
+            groups.append((i, i + 1))
+            i += 1
+
+    # Greedily keep the NEWEST groups until we'd exceed the tool-message cap.
+    # Walk groups from newest backwards, counting tool messages; the oldest
+    # groups that fall outside the cap are dropped as whole atomic units.
+    keep_from_group: int = len(groups)  # index of the first group to KEEP
+    kept_tools = 0
+    for gi in range(len(groups) - 1, -1, -1):
+        g_start, g_end = groups[gi]
+        g_tool_count = sum(
+            1 for k in range(g_start, g_end) if body[k].get("role") == "tool"
+        )
+        if kept_tools + g_tool_count > max_tool_msgs:
+            keep_from_group = gi + 1
+            break
+        kept_tools += g_tool_count
+        keep_from_group = gi
+
+    if keep_from_group == 0:
+        return messages  # cap covers the whole body after all
+
+    dropped_group_spans = groups[:keep_from_group]
+    dropped_tool_msgs = sum(
+        1
+        for (gs, ge) in dropped_group_spans
+        for k in range(gs, ge)
+        if body[k].get("role") == "tool"
+    )
+    dropped_assistant_toolcalls = sum(
+        1
+        for (gs, ge) in dropped_group_spans
+        for k in range(gs, ge)
+        if body[k].get("role") == "assistant" and body[k].get("tool_calls")
+    )
+
+    note = {
+        # role:"system" (NOT role:"tool"): the OpenAI/DeepSeek contract
+        # requires every role:"tool" message to reference a tool_call_id from a
+        # preceding assistant tool_calls entry; a standalone tool message with
+        # an unmatched sentinel id would be rejected with HTTP 400. compress()
+        # uses the same role:"system" summary shape for dropped turns.
+        "role": "system",
+        "content": (
+            f"[context window: {dropped_tool_msgs} earlier tool result(s) "
+            f"across {dropped_assistant_toolcalls} tool turn(s) omitted to "
+            f"bound context; full trace persisted]"
+        ),
+    }
+
+    # Reconstruct: preserved prefix + summary note + retained body groups.
+    out: list[dict[str, Any]] = list(messages[:first_tool_group_start])
+    out.append(note)
+    for gi in range(keep_from_group, len(groups)):
+        gs, ge = groups[gi]
+        out.extend(body[gs:ge])
+
+    logger.info(
+        "context bounding: dropped %d tool message(s) and %d paired assistant "
+        "tool_call turn(s) via sliding window (keep=%d); full trace persisted",
+        dropped_tool_msgs, dropped_assistant_toolcalls, max_tool_msgs,
+        extra={
+            "component": "context",
+            "knob": _MAX_TOOL_MESSAGES_ENV,
+            "dropped_tool_msgs": dropped_tool_msgs,
+            "dropped_assistant_toolcalls": dropped_assistant_toolcalls,
+            "kept": max_tool_msgs,
+        },
+    )
+    return out
 
 
 def build_context_manager() -> ContextManager:
