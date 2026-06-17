@@ -39,7 +39,7 @@ def store() -> MysqlStore:
         pytest.skip(f"MySQL unavailable: {exc}")
     # Clean any leftover rows from prior runs for deterministic counts.
     with s._engine.begin() as conn:  # noqa: SLF001
-        for t in ("rca_reports", "rca_runs", "cases", "config"):
+        for t in ("rca_reports", "rca_runs", "rca_steps", "cases", "config"):
             conn.execute(text(f"DELETE FROM `{t}`"))
     return s
 
@@ -559,3 +559,175 @@ def test_schema_sql_every_create_table_is_if_not_exists():
         f"{len(missing)} CREATE TABLE statement(s) lack IF NOT EXISTS (ensure_schema "
         "would crash on re-run)"
     )
+
+
+# --------------------------------------------------------------------------- #
+# rca_steps table DDL + split_statements (no DB)
+# --------------------------------------------------------------------------- #
+def test_schema_sql_has_rca_steps_table():
+    """``schema.sql`` must declare ``rca_steps`` with the Unit T1 columns."""
+    assert "CREATE TABLE IF NOT EXISTS `rca_steps`" in _schema_sql()
+    body = _table_body(_schema_sql(), "rca_steps")
+    for col, expected_type in [
+        ("step_id", "VARCHAR(96)"),
+        ("run_id", "VARCHAR(64)"),
+        ("case_id", "VARCHAR(64)"),
+        ("seq", "INT"),
+        ("step_kind", "VARCHAR(32)"),
+        ("payload", "LONGTEXT"),
+        ("created_at", "DATETIME"),
+    ]:
+        got = _column_type(body, col)
+        assert got == expected_type.upper(), (
+            f"schema.sql rca_steps.`{col}` expected {expected_type}, got {got}"
+        )
+    assert "PRIMARY KEY (`step_id`)" in body
+    assert "INDEX `ix_rca_steps_run_id` (`run_id`)" in body
+    assert "INDEX `ix_rca_steps_case_id` (`case_id`)" in body
+
+
+def test_schema_sql_splits_into_statements_containing_rca_steps():
+    """``_split_statements`` must yield a statement that creates ``rca_steps``."""
+    sql = _schema_sql()
+    stmts = [s.strip() for s in MysqlStore._split_statements(sql) if s.strip()]
+    assert any("CREATE TABLE IF NOT EXISTS `rca_steps`" in s for s in stmts), (
+        "rca_steps CREATE TABLE lost by _split_statements"
+    )
+
+
+def test_rca_steps_table_defined_offline():
+    """The Core ``rca_steps`` Table is declared with the expected columns."""
+    store = MysqlStore.from_engine(_FakeEngine(_op_error()))
+    t = store.metadata.tables["rca_steps"]
+    for col in (
+        "step_id",
+        "run_id",
+        "case_id",
+        "seq",
+        "step_kind",
+        "payload",
+        "created_at",
+    ):
+        assert col in t.c, f"rca_steps missing column {col}"
+    assert t.c.step_id.primary_key
+    # Index order in MetaData is set-based (non-deterministic); compare as a set.
+    assert {ix.name for ix in t.indexes} == {
+        "ix_rca_steps_run_id",
+        "ix_rca_steps_case_id",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Per-step trace DB-error handling via injected fake engine (no MySQL)
+#
+# Mirrors the existing save_report/list_reports error tests: inject a fake
+# engine that raises OperationalError on begin/connect, then assert the new
+# methods raise StoreError AND emit the single structured WARNING log.
+# --------------------------------------------------------------------------- #
+def _sample_step(step_id: str = "s1", case_id: str = "t-step") -> RcaStep:
+    return RcaStep(
+        step_id=step_id,
+        case_id=case_id,
+        step_kind=StepKind.TOOL_CALL,
+        tool_name="query_logs",
+        tool_args={"pod": "checkout-0"},
+    )
+
+
+def test_append_step_db_error_raises_store_error_and_logs(caplog):
+    store = MysqlStore.from_engine(_FakeEngine(_op_error("append refused")))
+    with (
+        caplog.at_level(logging.WARNING, logger="rca_agent.store.mysql_store"),
+        pytest.raises(StoreError, match="append_step failed"),
+    ):
+        store.append_step("run-1", "t-step", 0, _sample_step())
+    rec = _single_db_error_record(caplog, "append_step")
+    assert rec.op == "append_step"
+    assert rec.case_id == "t-step"
+    assert rec.run_id == "run-1"
+    assert rec.seq == 0
+    assert "refused" in rec.error
+
+
+def test_list_steps_db_error_raises_store_error_and_logs(caplog):
+    store = MysqlStore.from_engine(_FakeEngine(_op_error("list refused")))
+    with (
+        caplog.at_level(logging.WARNING, logger="rca_agent.store.mysql_store"),
+        pytest.raises(StoreError, match="list_steps failed"),
+    ):
+        store.list_steps("run-1", limit=10)
+    rec = _single_db_error_record(caplog, "list_steps")
+    assert rec.op == "list_steps"
+    assert rec.run_id == "run-1"
+    assert rec.limit == 10
+    assert "refused" in rec.error
+
+
+def test_list_runs_db_error_raises_store_error_and_logs(caplog):
+    store = MysqlStore.from_engine(_FakeEngine(_op_error("runs refused")))
+    with (
+        caplog.at_level(logging.WARNING, logger="rca_agent.store.mysql_store"),
+        pytest.raises(StoreError, match="list_runs failed"),
+    ):
+        store.list_runs(case_id="t-runs", limit=5)
+    rec = _single_db_error_record(caplog, "list_runs")
+    assert rec.op == "list_runs"
+    assert rec.case_id == "t-runs"
+    assert rec.limit == 5
+    assert "refused" in rec.error
+
+
+def test_get_run_db_error_raises_store_error_and_logs(caplog):
+    store = MysqlStore.from_engine(_FakeEngine(_op_error("get_run refused")))
+    with (
+        caplog.at_level(logging.WARNING, logger="rca_agent.store.mysql_store"),
+        pytest.raises(StoreError, match="get_run failed"),
+    ):
+        store.get_run("run-1")
+    rec = _single_db_error_record(caplog, "get_run")
+    assert rec.op == "get_run"
+    assert rec.run_id == "run-1"
+    assert "refused" in rec.error
+
+
+# --------------------------------------------------------------------------- #
+# _row_to_run_summary normalization (no DB)
+# --------------------------------------------------------------------------- #
+def test_row_to_run_summary_parses_token_usage_json():
+    row = {
+        "run_id": "r1",
+        "case_id": "c1",
+        "status": "completed",
+        "model": "m",
+        "started_at": None,
+        "finished_at": None,
+        "token_usage": json.dumps({"total": 7}),
+        "step_count": 3,
+    }
+    out = MysqlStore._row_to_run_summary(row)
+    assert out["run_id"] == "r1"
+    assert out["step_count"] == 3
+    assert out["token_usage"] == {"total": 7}
+
+
+def test_row_to_run_summary_handles_missing_and_invalid_token_usage():
+    # Missing token_usage (None).
+    base = {
+        "run_id": "r1",
+        "case_id": "c1",
+        "status": "running",
+        "model": "m",
+        "started_at": None,
+        "finished_at": None,
+        "token_usage": None,
+        "step_count": 0,
+    }
+    assert MysqlStore._row_to_run_summary(base)["token_usage"] is None
+    # Empty string.
+    bad = {**base, "token_usage": ""}
+    assert MysqlStore._row_to_run_summary(bad)["token_usage"] is None
+    # Non-JSON / non-object JSON.
+    bad2 = {**base, "token_usage": "not-json"}
+    assert MysqlStore._row_to_run_summary(bad2)["token_usage"] is None
+    bad3 = {**base, "token_usage": "[1, 2, 3]"}
+    assert MysqlStore._row_to_run_summary(bad3)["token_usage"] is None

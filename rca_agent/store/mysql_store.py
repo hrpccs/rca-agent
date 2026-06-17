@@ -28,10 +28,13 @@ from sqlalchemy import (
     DateTime,
     Double,
     Index,
+    Integer,
     MetaData,
     String,
     Table,
     Text,
+    func,
+    select,
     text,
 )
 from sqlalchemy.engine import Engine
@@ -169,6 +172,22 @@ class MysqlStore:
                 DateTime,
                 server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
             ),
+            mysql_engine="InnoDB",
+        )
+        # Per-step trace rows (Unit T1). ``seq`` preserves agent emit order for
+        # faithful replay; ``payload`` is the full RcaStep JSON.
+        self.rca_steps = Table(
+            "rca_steps",
+            self.metadata,
+            Column("step_id", String(96), primary_key=True),
+            Column("run_id", String(64), nullable=False),
+            Column("case_id", String(64), nullable=False),
+            Column("seq", Integer, nullable=False),
+            Column("step_kind", String(32), nullable=False),
+            Column("payload", Text(length=2**32 - 1), nullable=False),
+            Column("created_at", DateTime, server_default=text("CURRENT_TIMESTAMP")),
+            Index("ix_rca_steps_run_id", "run_id"),
+            Index("ix_rca_steps_case_id", "case_id"),
             mysql_engine="InnoDB",
         )
 
@@ -454,6 +473,212 @@ class MysqlStore:
                 },
             )
             raise StoreError(f"finish_run failed: {exc}") from exc
+
+    # ------------------------------------------------------------------ #
+    # Per-step trace persistence (Unit T1)
+    #
+    # These methods back incremental trace durability: each agent step
+    # (reasoning / tool_call / tool_result / conclude) is appended as it is
+    # emitted so a dropped SSE stream still leaves a durable (partial) trace
+    # and the frontend can replay a full run by ``run_id``.
+    # ------------------------------------------------------------------ #
+    def append_step(self, run_id: str, case_id: str, seq: int, step: RcaStep) -> None:
+        """Persist a single :class:`RcaStep` row for the given run.
+
+        ``seq`` is the per-run monotonic order (assigned by the caller, usually
+        the streaming coordinator) so :meth:`list_steps` can replay the run in
+        the exact order the agent emitted it even if rows arrive concurrently
+        or are re-fetched later. ``payload`` stores the full ``RcaStep`` JSON
+        so the table stays forward-compatible with optional contract fields.
+        """
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(
+                    self.rca_steps.insert(),
+                    {
+                        "step_id": step.step_id,
+                        "run_id": run_id,
+                        "case_id": case_id,
+                        "seq": seq,
+                        "step_kind": str(step.step_kind),
+                        "payload": step.model_dump_json(),
+                    },
+                )
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "append_step: DB error case_id=%s run_id=%s seq=%s step_id=%s — %s",
+                case_id,
+                run_id,
+                seq,
+                step.step_id,
+                exc,
+                extra={
+                    "op": "append_step",
+                    "case_id": case_id,
+                    "run_id": run_id,
+                    "seq": seq,
+                    "step_id": step.step_id,
+                    "error": str(exc),
+                },
+            )
+            raise StoreError(f"append_step failed: {exc}") from exc
+
+    def list_steps(self, run_id: str, limit: int = 20000) -> list[RcaStep]:
+        """Return the run's steps in emit (``seq``) order.
+
+        ``limit`` defaults large (20k) so a full long-running trace is returned
+        in one call by default; callers needing pagination may pass a smaller
+        value. Rehydrates each row via :meth:`RcaStep.model_validate_json` so
+        round-tripping a step is lossless.
+        """
+        sel = (
+            select(self.rca_steps.c.payload)
+            .where(self.rca_steps.c.run_id == run_id)
+            .order_by(self.rca_steps.c.seq)
+            .limit(limit)
+        )
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(sel).mappings().all()
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "list_steps: DB error run_id=%s limit=%s — %s",
+                run_id,
+                limit,
+                exc,
+                extra={
+                    "op": "list_steps",
+                    "run_id": run_id,
+                    "limit": limit,
+                    "error": str(exc),
+                },
+            )
+            raise StoreError(f"list_steps failed: {exc}") from exc
+        return [RcaStep.model_validate_json(row["payload"]) for row in rows]
+
+    def list_runs(
+        self, case_id: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """List run summaries newest-first, optionally filtered by ``case_id``.
+
+        Each entry is a plain dict with ``run_id``, ``case_id``, ``status``,
+        ``model``, ``started_at``, ``finished_at``, ``token_usage`` (parsed
+        from JSON when present, else ``None``) and ``step_count`` — the number
+        of persisted steps for that run (correlated COUNT via a LEFT JOIN on
+        ``rca_steps``).
+        """
+        step_count = func.count(self.rca_steps.c.step_id).label("step_count")
+        sel = (
+            select(
+                self.rca_runs.c.run_id,
+                self.rca_runs.c.case_id,
+                self.rca_runs.c.status,
+                self.rca_runs.c.model,
+                self.rca_runs.c.started_at,
+                self.rca_runs.c.finished_at,
+                self.rca_runs.c.token_usage,
+                step_count,
+            )
+            .select_from(
+                self.rca_runs.outerjoin(
+                    self.rca_steps,
+                    self.rca_runs.c.run_id == self.rca_steps.c.run_id,
+                )
+            )
+            .group_by(self.rca_runs.c.run_id)
+            .order_by(self.rca_runs.c.started_at.desc())
+            .limit(limit)
+        )
+        if case_id is not None:
+            sel = sel.where(self.rca_runs.c.case_id == case_id)
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(sel).mappings().all()
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "list_runs: DB error case_id=%s limit=%s — %s",
+                case_id,
+                limit,
+                exc,
+                extra={
+                    "op": "list_runs",
+                    "case_id": case_id,
+                    "limit": limit,
+                    "error": str(exc),
+                },
+            )
+            raise StoreError(f"list_runs failed: {exc}") from exc
+        return [self._row_to_run_summary(r) for r in rows]
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        """Return the run summary dict (with ``step_count``) or ``None``.
+
+        Deliberately cheap: it does NOT embed the full step list (the server
+        composes that via :meth:`list_steps`). Returns ``None`` only when the
+        run row is absent — DB errors still raise :class:`StoreError`.
+        """
+        step_count = func.count(self.rca_steps.c.step_id).label("step_count")
+        sel = (
+            select(
+                self.rca_runs.c.run_id,
+                self.rca_runs.c.case_id,
+                self.rca_runs.c.status,
+                self.rca_runs.c.model,
+                self.rca_runs.c.started_at,
+                self.rca_runs.c.finished_at,
+                self.rca_runs.c.token_usage,
+                step_count,
+            )
+            .select_from(
+                self.rca_runs.outerjoin(
+                    self.rca_steps,
+                    self.rca_runs.c.run_id == self.rca_steps.c.run_id,
+                )
+            )
+            .where(self.rca_runs.c.run_id == run_id)
+            .group_by(self.rca_runs.c.run_id)
+        )
+        try:
+            with self._engine.connect() as conn:
+                row = conn.execute(sel).mappings().first()
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "get_run: DB error run_id=%s — %s",
+                run_id,
+                exc,
+                extra={"op": "get_run", "run_id": run_id, "error": str(exc)},
+            )
+            raise StoreError(f"get_run failed: {exc}") from exc
+        if row is None:
+            return None
+        return self._row_to_run_summary(row)
+
+    @staticmethod
+    def _row_to_run_summary(row: Any) -> dict[str, Any]:
+        """Normalize a joined ``rca_runs``+step-count row into a summary dict.
+
+        ``token_usage`` is stored as JSON text (see :meth:`finish_run`); parse
+        it when present, else leave ``None``. Kept as a static helper so both
+        :meth:`list_runs` and :meth:`get_run` share one normalization path.
+        """
+        raw_usage = row["token_usage"]
+        token_usage: dict[str, Any] | None = None
+        if raw_usage is not None and raw_usage != "":
+            try:
+                parsed = json.loads(raw_usage)
+                token_usage = parsed if isinstance(parsed, dict) else None
+            except (json.JSONDecodeError, TypeError):
+                token_usage = None
+        return {
+            "run_id": row["run_id"],
+            "case_id": row["case_id"],
+            "status": row["status"],
+            "model": row["model"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "token_usage": token_usage,
+            "step_count": int(row["step_count"]),
+        }
 
     # ------------------------------------------------------------------ #
     # Cases
