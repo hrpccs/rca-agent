@@ -10,11 +10,20 @@ models.
 Construction:
     ClickhouseProvider(case_id)           # uses get_settings().clickhouse_dsn()
     ClickhouseProvider.from_case(case_id) # classmethod alternative
+
+A query/socket timeout (``RCA_CLICKHOUSE_QUERY_TIMEOUT_SEC``, default 30s) is
+applied at client creation via clickhouse-connect's ``send_receive_timeout``
+(the HTTP read/socket timeout). A failure on any modality query is caught,
+logged structurally, and surfaced as an empty result rather than crashing the
+agent loop — the other modalities still run.
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import logging
+import os
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +47,12 @@ from rca_agent.contracts import (
     Trace,
     TraceFilter,
 )
+
+logger = logging.getLogger(__name__)
+
+# Default socket/read timeout (seconds) handed to clickhouse-connect as
+# ``send_receive_timeout``. Overridable via env without touching config.py.
+_DEFAULT_QUERY_TIMEOUT_SEC = 30
 
 _SCHEMA_PATH = Path(__file__).with_name("clickhouse_schema.sql")
 
@@ -102,9 +117,9 @@ def _window_datetimes(window: TimeWindow) -> tuple[datetime, datetime]:
     start = window.start
     end = window.end
     if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
+        start = start.replace(tzinfo=UTC)
     if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
+        end = end.replace(tzinfo=UTC)
     return start, end
 
 
@@ -120,6 +135,23 @@ def _in_clause(values: list[str] | None) -> tuple[str | None, list[str]]:
     return ph, list(values)
 
 
+def _query_timeout_sec() -> int:
+    """Return the ClickHouse query/socket timeout in seconds.
+
+    Read from ``RCA_CLICKHOUSE_QUERY_TIMEOUT_SEC`` (env); falls back to the
+    module default (30). Invalid values fall back to the default rather than
+    raising so a misconfigured env can't brick the provider.
+    """
+    raw = os.environ.get("RCA_CLICKHOUSE_QUERY_TIMEOUT_SEC")
+    if not raw:
+        return _DEFAULT_QUERY_TIMEOUT_SEC
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_QUERY_TIMEOUT_SEC
+    return v if v > 0 else _DEFAULT_QUERY_TIMEOUT_SEC
+
+
 # --------------------------------------------------------------------------- #
 # Provider
 # --------------------------------------------------------------------------- #
@@ -131,6 +163,8 @@ class ClickhouseProvider:
         case_id: str,
         dsn: dict[str, Any] | None = None,
         window: TimeWindow | None = None,
+        client: Any | None = None,
+        client_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.case_id = case_id
         # The investigation tools read `provider.window` (the case alert window)
@@ -138,15 +172,52 @@ class ClickhouseProvider:
         # Case; mirror it here so the ClickHouse backend isn't blind to time.
         # Optional — standalone/schema-only construction leaves it unset.
         self.window: TimeWindow | None = window
-        cfg = dsn if dsn is not None else get_settings().clickhouse_dsn()
+        if client is not None:
+            # Direct injection (tests / DI). Bypass env-derived construction.
+            self._client = client
+            return
+        cfg = dict(dsn if dsn is not None else get_settings().clickhouse_dsn())
+        # Apply the query/socket timeout at client creation. clickhouse-connect
+        # accepts ``send_receive_timeout`` (HTTP read + socket timeout). If the
+        # caller already supplied it via dsn, respect their value.
+        cfg.setdefault("send_receive_timeout", _query_timeout_sec())
+        factory = client_factory or clickhouse_connect.get_client
         # clickhouse_connect uses port 8123 (HTTP) by default; the dsn from
         # settings already carries the configured port.
-        self._client = clickhouse_connect.get_client(**cfg)
+        self._client = factory(**cfg)
 
     # -- Protocol construction alternative ------------------------------- #
     @classmethod
     def from_case(cls, case_id: str) -> ClickhouseProvider:
         return cls(case_id)
+
+    # -- Internal: run a query, swallowing connection errors -------------- #
+    def _query_rows(self, sql: str, params: list[Any]) -> list[tuple]:
+        """Execute ``self._client.query(sql, params)`` returning ``result_rows``.
+
+        Any exception from the client (connection refused, timeout, socket
+        error, ClickHouse server error) is caught, logged structurally with the
+        modality context, and an empty row list is returned — the caller then
+        maps that to an empty result. This keeps a single backend failure from
+        aborting the whole RCA loop; the other modalities still run.
+        """
+        try:
+            rows = self._client.query(sql, params).result_rows
+            # result_rows is already a concrete list in clickhouse-connect; the
+            # `or []` only guarantees the empty-list contract if a client ever
+            # returns None.
+            return rows or []
+        except Exception as exc:  # noqa: BLE001 — provider must not crash callers
+            logger.error(
+                "clickhouse.query_failed",
+                extra={
+                    "case_id": self.case_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "sql_head": sql[:120],
+                },
+            )
+            return []
 
     # -- Schema bootstrap (convenience; not part of the Protocol) -------- #
     def ensure_schema(self) -> None:
@@ -195,7 +266,7 @@ class ClickhouseProvider:
             + " ORDER BY entity_id, metric, time "
             f"LIMIT {int(f.limit)}"
         )
-        rows = self._client.query(sql, params).result_rows
+        rows = self._query_rows(sql, params)
 
         # Group points into MetricSeries.
         series: dict[tuple[str, str], MetricSeries] = {}
@@ -245,7 +316,7 @@ class ClickhouseProvider:
             + " ORDER BY `_time_` "
             f"LIMIT {int(f.limit)}"
         )
-        rows = self._client.query(sql, params).result_rows
+        rows = self._query_rows(sql, params)
         out: list[LogLine] = []
         for content, t, pod, ns, ctr, host in rows:
             out.append(
@@ -287,7 +358,7 @@ class ClickhouseProvider:
             + " ORDER BY traceId, startTime "
             f"LIMIT {int(f.limit)}"
         )
-        rows = self._client.query(sql, params).result_rows
+        rows = self._query_rows(sql, params)
 
         traces: dict[str, Trace] = {}
         for (
@@ -338,7 +409,7 @@ class ClickhouseProvider:
             + " ORDER BY `_time_` "
             f"LIMIT {int(f.limit)}"
         )
-        rows = self._client.query(sql, params).result_rows
+        rows = self._query_rows(sql, params)
         out: list[K8sEvent] = []
         for event_id, host, level, pod, cluster_id, t in rows:
             meta = _safe_json(event_id)
@@ -384,10 +455,10 @@ class ClickhouseProvider:
             + " ORDER BY `_time_` "
             f"LIMIT {int(f.limit)}"
         )
-        rows = self._client.query(sql, params).result_rows
+        rows = self._query_rows(sql, params)
         out: list[CloudEvent] = []
         for (
-            aid, atype, asub, sev, status, subject, t, resource, labels, annotations, data
+            aid, atype, asub, sev, status, subject, t, resource, labels, annotations_col, data
         ) in rows:
             out.append(
                 CloudEvent(
@@ -400,7 +471,7 @@ class ClickhouseProvider:
                     ts=t if isinstance(t, datetime) else None,
                     resource=_safe_json(resource),
                     labels=_safe_json(labels),
-                    annotations=_safe_json(annotations),
+                    annotations=_safe_json(annotations_col),
                     data=_safe_json(data),
                 )
             )
@@ -426,7 +497,7 @@ class ClickhouseProvider:
             + " AND ".join(ent_where)
             + f" LIMIT {int(f.limit)}"
         )
-        ent_rows = self._client.query(ent_sql, ent_params).result_rows
+        ent_rows = self._query_rows(ent_sql, ent_params)
 
         entities: list[dict[str, Any]] = []
         seed_ids: list[str] = []
@@ -451,11 +522,11 @@ class ClickhouseProvider:
             ph, p = _in_clause(f.relations)
             if ph:
                 edges_sql += f" AND relation IN ({ph})"
-                edge_rows = self._client.query(edges_sql, [self.case_id, *p]).result_rows
+                edge_rows = self._query_rows(edges_sql, [self.case_id, *p])
             else:
-                edge_rows = self._client.query(edges_sql, [self.case_id]).result_rows
+                edge_rows = self._query_rows(edges_sql, [self.case_id])
         else:
-            edge_rows = self._client.query(edges_sql, [self.case_id]).result_rows
+            edge_rows = self._query_rows(edges_sql, [self.case_id])
 
         all_edges = [
             {
@@ -499,11 +570,11 @@ class ClickhouseProvider:
             extra_ids = reachable - {e["id"] for e in entities}
             if extra_ids:
                 ph = ", ".join(["%s"] * len(extra_ids))
-                extra_rows = self._client.query(
+                extra_rows = self._query_rows(
                     "SELECT id, type, name, first_observed, last_observed, props "
                     f"FROM topology_entities WHERE case_id = %s AND id IN ({ph})",
                     [self.case_id, *extra_ids],
-                ).result_rows
+                )
                 for eid, etype, name, fo, lo, props in extra_rows:
                     entities.append(
                         {

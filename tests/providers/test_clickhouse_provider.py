@@ -6,7 +6,7 @@ DB; the mapping/SQL-building/render logic is what matters here. A separate
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -34,8 +34,8 @@ from rca_agent.providers.clickhouse_provider import ClickhouseProvider
 @pytest.fixture
 def window() -> TimeWindow:
     return TimeWindow(
-        start=datetime(2026, 4, 25, 5, 18, 12, tzinfo=timezone.utc),
-        end=datetime(2026, 4, 25, 5, 28, 12, tzinfo=timezone.utc),
+        start=datetime(2026, 4, 25, 5, 18, 12, tzinfo=UTC),
+        end=datetime(2026, 4, 25, 5, 28, 12, tzinfo=UTC),
         start_us=1777094292716735,
         end_us=1777094892716735,
     )
@@ -99,8 +99,8 @@ def test_window_us_prefers_us_fields(window):
 
 def test_window_us_falls_back_to_datetime():
     w = TimeWindow(
-        start=datetime(2026, 4, 25, 0, 0, 0, tzinfo=timezone.utc),
-        end=datetime(2026, 4, 26, 0, 0, 0, tzinfo=timezone.utc),
+        start=datetime(2026, 4, 25, 0, 0, 0, tzinfo=UTC),
+        end=datetime(2026, 4, 26, 0, 0, 0, tzinfo=UTC),
     )
     s, e = mod._window_us(w)
     assert s == int(w.start.timestamp() * 1_000_000)
@@ -192,7 +192,7 @@ def test_query_metrics_in_clause_filters(window):
 # --------------------------------------------------------------------------- #
 def test_query_logs_maps_row(window):
     rows = [
-        ("err boom", datetime(2026, 4, 25, 5, 20, tzinfo=timezone.utc), "pod1", "ns", "ctr", "h1"),
+        ("err boom", datetime(2026, 4, 25, 5, 20, tzinfo=UTC), "pod1", "ns", "ctr", "h1"),
     ]
     p, fake = _make_provider(rows)
     out = p.query_logs(LogFilter(window=window, contains="boom"))
@@ -250,7 +250,7 @@ def test_query_traces_min_duration(window):
 # --------------------------------------------------------------------------- #
 def test_query_events_parses_event_id_json(window):
     event_id = '{"reason":"BackOff","message":"stop","metadata":{"name":"p.x"}}'
-    rows = [(event_id, "h1", "Warning", "p1", "c1", datetime(2026, 4, 25, tzinfo=timezone.utc))]
+    rows = [(event_id, "h1", "Warning", "p1", "c1", datetime(2026, 4, 25, tzinfo=UTC))]
     p, _ = _make_provider(rows)
     out = p.query_events(EventFilter(window=window, levels=["Warning"]))
     assert len(out) == 1
@@ -273,7 +273,7 @@ def test_query_alerts_parses_json_columns(window):
     rows = [
         (
             "id1", "alert", "sub", "CRITICAL", "Alarm", "checkout",
-            datetime(2026, 4, 25, tzinfo=timezone.utc),
+            datetime(2026, 4, 25, tzinfo=UTC),
             '{"entity":{"id":"x"}}', '{"a":"b"}', '{"ann":1}', '{"detailValue":[1]}',
         )
     ]
@@ -407,6 +407,194 @@ def test_from_case_returns_provider_instance(monkeypatch):
     assert isinstance(p, ClickhouseProvider)
     assert p.case_id == "t042"
     assert captured["database"] == "rca"
+    # query/socket timeout applied at client creation (default).
+    assert captured["send_receive_timeout"] == 30
+
+
+# --------------------------------------------------------------------------- #
+# Query timeout (env RCA_CLICKHOUSE_QUERY_TIMEOUT_SEC)
+# --------------------------------------------------------------------------- #
+def test_query_timeout_default_is_30():
+    assert mod._query_timeout_sec() == 30
+
+
+def test_query_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("RCA_CLICKHOUSE_QUERY_TIMEOUT_SEC", "11")
+    assert mod._query_timeout_sec() == 11
+
+
+def test_query_timeout_env_invalid_falls_back(monkeypatch):
+    monkeypatch.setenv("RCA_CLICKHOUSE_QUERY_TIMEOUT_SEC", "not-a-number")
+    assert mod._query_timeout_sec() == 30
+    monkeypatch.setenv("RCA_CLICKHOUSE_QUERY_TIMEOUT_SEC", "-5")
+    assert mod._query_timeout_sec() == 30
+
+
+def test_query_timeout_passed_to_client_factory(monkeypatch):
+    captured = {}
+
+    def fake_factory(**kw):
+        captured.update(kw)
+        return _FakeClient()
+
+    monkeypatch.setenv("RCA_CLICKHOUSE_QUERY_TIMEOUT_SEC", "42")
+    ClickhouseProvider("t001", client_factory=fake_factory)
+    assert captured["send_receive_timeout"] == 42
+
+
+def test_query_timeout_respects_dsn_override(monkeypatch):
+    # An explicit send_receive_timeout in the dsn must NOT be clobbered.
+    captured = {}
+
+    def fake_factory(**kw):
+        captured.update(kw)
+        return _FakeClient()
+
+    monkeypatch.setenv("RCA_CLICKHOUSE_QUERY_TIMEOUT_SEC", "42")
+    ClickhouseProvider(
+        "t001",
+        dsn={"host": "h", "port": 8123, "send_receive_timeout": 7},
+        client_factory=fake_factory,
+    )
+    assert captured["send_receive_timeout"] == 7
+
+
+# --------------------------------------------------------------------------- #
+# Client injection (constructor + factory)
+# --------------------------------------------------------------------------- #
+def test_constructor_accepts_injected_client(window):
+    fake = _FakeClient()
+    p = ClickhouseProvider("t001", client=fake)
+    assert p._client is fake
+    # Injected client bypasses factory entirely — no env/DSN read needed.
+    p.query_logs(LogFilter(window=window))
+    assert len(fake.queries) == 1
+
+
+def test_constructor_uses_factory_when_no_client():
+    calls = []
+
+    def fake_factory(**kw):
+        calls.append(kw)
+        return _FakeClient()
+
+    p = ClickhouseProvider("t001", client_factory=fake_factory)
+    assert len(calls) == 1
+    assert calls[0]["database"] == "rca"
+    assert isinstance(p._client, _FakeClient)
+
+
+# --------------------------------------------------------------------------- #
+# Connection-error resilience
+# --------------------------------------------------------------------------- #
+class _ExplodingClient:
+    """A client whose .query always raises (simulates CH down / socket error)."""
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    def query(self, sql: str, params: list[Any] | None = None):
+        self.calls += 1
+        raise self.exc
+
+
+def _explode_provider(exc: Exception) -> ClickhouseProvider:
+    return ClickhouseProvider("t001", client=_ExplodingClient(exc))
+
+
+def test_query_error_returns_empty_not_none(window, caplog):
+    p = _explode_provider(ConnectionError("refused"))
+    with caplog.at_level("ERROR"):
+        out = p.query_logs(LogFilter(window=window))
+    assert out == []  # empty, not None, not raised
+    # structural log emitted
+    assert any("clickhouse.query_failed" in r.message or "query_failed" in r.message
+               for r in caplog.records)
+    rec = next(r for r in caplog.records if "query_failed" in r.message)
+    assert rec.case_id == "t001"  # type: ignore[attr-defined]
+
+
+def test_query_error_all_modalities_survive(window, caplog):
+    """Each modality swallows the error and returns an empty result."""
+    p = _explode_provider(TimeoutError("read timeout"))
+    with caplog.at_level("ERROR"):
+        assert p.query_metrics(MetricFilter(window=window)) == []
+        assert p.query_logs(LogFilter(window=window)) == []
+        assert p.query_traces(TraceFilter(window=window)) == []
+        assert p.query_events(EventFilter(window=window)) == []
+        assert p.query_alerts(AlertFilter(window=window)) == []
+    sub = p.query_topology(TopologyFilter())
+    assert sub.entities == [] and sub.edges == []
+    # At least one structural failure log per modality (5 list-returning +
+    # topology, which issues 1+ queries). Assert presence, not exact count,
+    # so the test isn't coupled to topology's internal query branching.
+    fails = [r for r in caplog.records if "query_failed" in r.message]
+    assert len(fails) >= 6
+
+
+def test_query_error_logs_error_type_and_message(window, caplog):
+    p = _explode_provider(OSError("connection reset"))
+    with caplog.at_level("ERROR"):
+        p.query_alerts(AlertFilter(window=window))
+    rec = next(r for r in caplog.records if "query_failed" in r.message)
+    assert rec.error_type == "OSError"  # type: ignore[attr-defined]
+    assert "connection reset" in rec.error  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- #
+# Renderers: full coverage for all 6 modalities with non-empty data
+# --------------------------------------------------------------------------- #
+def test_render_logs_non_empty():
+    from rca_agent.contracts import LogLine
+
+    p, _ = _make_provider()
+    txt = p.render_logs([LogLine(
+        ts=datetime(2026, 4, 25, 5, 20, tzinfo=UTC),
+        pod="api-1", content="boom",
+    )])
+    assert "## Logs" in txt
+    assert "api-1" in txt and "boom" in txt
+
+
+def test_render_events_non_empty():
+    from rca_agent.contracts import K8sEvent
+
+    p, _ = _make_provider()
+    txt = p.render_events([K8sEvent(
+        ts=datetime(2026, 4, 25, 5, 20, tzinfo=UTC),
+        level="Warning", pod="api-1", reason="BackOff", message="stopping",
+    )])
+    assert "## Events" in txt
+    assert "Warning" in txt and "BackOff" in txt and "stopping" in txt
+
+
+def test_render_alerts_non_empty():
+    from rca_agent.contracts import CloudEvent
+
+    p, _ = _make_provider()
+    txt = p.render_alerts([CloudEvent(
+        id="a1", type="alert", severity="CRITICAL", subtype="sub",
+        subject="checkout", status="Alarm", ts=datetime(2026, 4, 25, tzinfo=UTC),
+        data={"detail": "x"},
+    )])
+    assert "## Alerts" in txt
+    assert "CRITICAL" in txt and "checkout" in txt and "Alarm" in txt
+    assert "detail" in txt  # data JSON rendered
+
+
+def test_render_topology_non_empty():
+    from rca_agent.contracts import TopologySubgraph
+
+    p, _ = _make_provider()
+    sub = TopologySubgraph(
+        entities=[{"id": "e1", "type": "svc", "name": "checkout"}],
+        edges=[{"src": "e1", "src_type": "svc", "dst": "e2", "dst_type": "svc", "relation": "calls"}],
+    )
+    txt = p.render_topology(sub)
+    assert "## Topology" in txt
+    assert "Entities:" in txt and "Edges:" in txt
+    assert "checkout" in txt and "calls" in txt
 
 
 # --------------------------------------------------------------------------- #
