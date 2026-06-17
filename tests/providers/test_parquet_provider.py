@@ -1,13 +1,17 @@
 """Tests for the Parquet DataProvider (U1) against the real rca100 t001 case.
 
-These are integration tests: they require the on-disk benchmark dataset
-(default cases_dir). They are skipped automatically when t001 is unavailable
-so the suite stays green on a fresh checkout without data.
+Dataset-backed tests require the on-disk benchmark dataset (default cases_dir)
+and are skipped automatically when t001 is unavailable so the suite stays green
+on a fresh checkout without data. The synthetic cache/robustness tests at the
+bottom of this file build their own pyarrow tables and always run.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from rca_agent.cases import load_case
@@ -27,6 +31,7 @@ from rca_agent.contracts import (
     Trace,
     TraceFilter,
 )
+from rca_agent.contracts.dataset import Case, Task, Topology
 from rca_agent.providers.parquet_provider import (
     ParquetProvider,
     _as_float,
@@ -40,11 +45,19 @@ from rca_agent.providers.parquet_provider import (
     render,
 )
 
-_T001_DIR = __import__("pathlib").Path(load_case("t001").case_dir)
-pytestmark = pytest.mark.skipif(
-    not (_T001_DIR / "metrics.parquet").exists(),
-    reason="t001 dataset not available",
-)
+# Resolve the t001 case dir defensively: load_case reads task.json/topology.json
+# and would raise FileNotFoundError at collection time on a fresh checkout
+# without the dataset. Guard it so the synthetic TestCache / TestMalformed
+# classes below (which never touch the dataset) still run.
+try:
+    _T001_DIR = Path(load_case("t001").case_dir)
+    _T001_AVAILABLE = (_T001_DIR / "metrics.parquet").exists()
+except (FileNotFoundError, OSError):
+    _T001_DIR = None
+    _T001_AVAILABLE = False
+# Skip ONLY the dataset-backed tests; the synthetic TestCache / TestMalformed
+# classes at the bottom are unmarked so they run on a fresh checkout.
+needs_t001 = pytest.mark.skipif(not _T001_AVAILABLE, reason="t001 dataset not available")
 
 
 @pytest.fixture(scope="module")
@@ -126,6 +139,7 @@ class TestCoercionHelpers:
 # --------------------------------------------------------------------------- #
 # Provider construction + Protocol conformance
 # --------------------------------------------------------------------------- #
+@needs_t001
 class TestProviderBasics:
     def test_satisfies_protocol(self, provider: ParquetProvider):
         # ParquetProvider must satisfy the runtime-checkable DataProvider.
@@ -148,6 +162,7 @@ class TestProviderBasics:
 # --------------------------------------------------------------------------- #
 # query_metrics
 # --------------------------------------------------------------------------- #
+@needs_t001
 class TestQueryMetrics:
     def test_window_filter_returns_results(self, provider: ParquetProvider):
         out = provider.query_metrics(MetricFilter(window=provider.window, limit=50))
@@ -191,6 +206,7 @@ class TestQueryMetrics:
 # --------------------------------------------------------------------------- #
 # query_logs
 # --------------------------------------------------------------------------- #
+@needs_t001
 class TestQueryLogs:
     def test_window_filter(self, provider: ParquetProvider):
         out = provider.query_logs(LogFilter(window=provider.window, limit=10))
@@ -235,6 +251,7 @@ class TestQueryLogs:
 # --------------------------------------------------------------------------- #
 # query_traces
 # --------------------------------------------------------------------------- #
+@needs_t001
 class TestQueryTraces:
     def test_window_returns_traces(self, provider: ParquetProvider):
         out = provider.query_traces(TraceFilter(window=provider.window, limit=10))
@@ -288,6 +305,7 @@ class TestQueryTraces:
 # --------------------------------------------------------------------------- #
 # query_events
 # --------------------------------------------------------------------------- #
+@needs_t001
 class TestQueryEvents:
     def test_events_returned(self, provider: ParquetProvider):
         # Events often predate the alert window; use a wide window.
@@ -314,6 +332,7 @@ class TestQueryEvents:
 # --------------------------------------------------------------------------- #
 # query_alerts
 # --------------------------------------------------------------------------- #
+@needs_t001
 class TestQueryAlerts:
     def test_alerts_in_window(self, provider: ParquetProvider):
         out = provider.query_alerts(AlertFilter(window=provider.window, limit=50))
@@ -334,6 +353,7 @@ class TestQueryAlerts:
 # --------------------------------------------------------------------------- #
 # query_topology
 # --------------------------------------------------------------------------- #
+@needs_t001
 class TestQueryTopology:
     def test_full_graph(self, provider: ParquetProvider):
         sub = provider.query_topology(TopologyFilter())
@@ -380,8 +400,6 @@ class TestQueryTopology:
 # --------------------------------------------------------------------------- #
 class TestRobustness:
     def test_missing_file_returns_empty(self, tmp_path):
-        from rca_agent.contracts.dataset import Case, Task, Topology
-
         # Build a Case whose case_dir has no parquet files.
         tw = TimeWindow(
             start=datetime(2026, 4, 25, 0, 0, tzinfo=timezone.utc),
@@ -401,8 +419,194 @@ class TestRobustness:
 
 
 # --------------------------------------------------------------------------- #
+# Bounded LRU table cache (U9)
+# --------------------------------------------------------------------------- #
+# A wide window that captures the synthetic rows below regardless of the
+# metric time value we write.
+_WIDE_WINDOW = TimeWindow(
+    start=datetime(2026, 4, 25, 0, 0, tzinfo=timezone.utc),
+    end=datetime(2026, 4, 26, 0, 0, tzinfo=timezone.utc),
+    start_us=0,
+    end_us=2**53,
+)
+
+
+def _synthetic_case(tmp_path: Path, case_id: str = "synth") -> Case:
+    """Build a minimal Case whose case_dir is ``tmp_path`` (no parquet yet)."""
+    return Case(
+        task=Task(task_id=case_id, alert_title="x", alert_window=_WIDE_WINDOW, prompt_text=""),
+        topology=Topology(case_id=case_id, window=_WIDE_WINDOW),
+        case_dir=str(tmp_path),
+    )
+
+
+def _write_metrics_parquet(
+    tmp_path: Path, rows: list[dict], columns: dict[str, pa.DataType] | None = None
+) -> Path:
+    """Write a synthetic metrics.parquet into ``tmp_path`` and return its path.
+
+    ``rows`` are written as-is; ``columns`` lets the caller override types
+    (e.g. to store a JSON-string column as a non-string type for malformed
+    cases). When ``columns`` is None the schema is inferred from ``rows``.
+    """
+    path = tmp_path / "metrics.parquet"
+    if columns is not None:
+        arrays = [pa.array([r.get(c) for r in rows], type=t) for c, t in columns.items()]
+        table = pa.Table.from_arrays(arrays, names=list(columns.keys()))
+    elif rows:
+        table = pa.Table.from_pylist(rows)
+    else:
+        # 0-row table with a single placeholder column so the file is valid.
+        table = pa.table({"time": pa.array([], type=pa.int64())})
+    pq.write_table(table, path)
+    return path
+
+
+class TestCacheDefaults:
+    def test_default_maxsize_is_64(self):
+        # Ensures the env-tunable preserves the documented default benefit.
+        p = ParquetProvider(_synthetic_case(Path("/tmp/__does_not_exist_u9__")))
+        assert p._cache_max == 64
+
+
+class TestCacheMaxsizeEnvOverride:
+    def test_env_overrides_maxsize(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RCA_PARQUET_CACHE_MAX", "3")
+        p = ParquetProvider(_synthetic_case(tmp_path))
+        assert p._cache_max == 3
+
+    def test_nonpositive_env_falls_back_to_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RCA_PARQUET_CACHE_MAX", "0")
+        assert ParquetProvider(_synthetic_case(tmp_path))._cache_max == 64
+        monkeypatch.setenv("RCA_PARQUET_CACHE_MAX", "-5")
+        assert ParquetProvider(_synthetic_case(tmp_path))._cache_max == 64
+
+    def test_garbage_env_falls_back_to_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RCA_PARQUET_CACHE_MAX", "not-a-number")
+        assert ParquetProvider(_synthetic_case(tmp_path))._cache_max == 64
+
+
+class TestCacheHitAndEviction:
+    def test_cache_hit_returns_same_table_object(self, tmp_path):
+        # Two reads of the same (name, columns) must hit the cache: the
+        # underlying pyarrow Table is reused (only ONE cache entry exists).
+        _write_metrics_parquet(
+            tmp_path,
+            [{"time": 1, "domain": "k8s", "entity_id": "e1", "metric": "cpu", "value": 1.0}],
+        )
+        p = ParquetProvider(_synthetic_case(tmp_path))
+        first = p._read("metrics.parquet", ["time", "metric", "value"])
+        second = p._read("metrics.parquet", ["time", "metric", "value"])
+        assert first == second
+        # Same column-set => same cache key => the cached Table is the ONLY entry.
+        cached_keys = list(p._table_cache.keys())
+        assert cached_keys == [("metrics.parquet", frozenset({"time", "metric", "value"}))]
+
+    def test_exceeding_maxsize_evicts_lru(self, tmp_path, monkeypatch):
+        # maxsize=2: insert A, B (full); touch A (A=MRU, B=LRU); insert C ->
+        # B evicted, A+C remain.
+        monkeypatch.setenv("RCA_PARQUET_CACHE_MAX", "2")
+        _write_metrics_parquet(tmp_path, [{"time": 1, "metric": "m", "value": 1.0}])
+        p = ParquetProvider(_synthetic_case(tmp_path))
+
+        # Distinct column-sets give distinct cache keys against the one file.
+        p._read("metrics.parquet", ["time", "metric", "value"])          # key A
+        p._read("metrics.parquet", ["time", "metric"])                   # key B
+        assert len(p._table_cache) == 2
+        # Touch A so B becomes the LRU.
+        p._read("metrics.parquet", ["time", "metric", "value"])          # A -> MRU
+        # Insert C: exceeds maxsize -> evict LRU (B).
+        p._read("metrics.parquet", ["time"])                             # key C
+        assert len(p._table_cache) == 2
+        keys = set(p._table_cache.keys())
+        # B (["time","metric"]) was evicted; A and C remain.
+        assert ("metrics.parquet", frozenset({"time", "metric", "value"})) in keys
+        assert ("metrics.parquet", frozenset({"time"})) in keys
+        assert ("metrics.parquet", frozenset({"time", "metric"})) not in keys
+
+    def test_lru_order_moves_on_hit(self, tmp_path, monkeypatch):
+        # maxsize=1: insert A, then B evicts A; re-reading A (a miss now)
+        # re-populates it and evicts B; a subsequent hit on the sole entry
+        # must NOT change the cache size.
+        monkeypatch.setenv("RCA_PARQUET_CACHE_MAX", "1")
+        _write_metrics_parquet(tmp_path, [{"time": 1, "metric": "m", "value": 1.0}])
+        p = ParquetProvider(_synthetic_case(tmp_path))
+        p._read("metrics.parquet", ["time", "metric", "value"])  # A
+        p._read("metrics.parquet", ["time", "metric"])           # B, evicts A
+        assert len(p._table_cache) == 1
+        assert ("metrics.parquet", frozenset({"time", "metric"})) in p._table_cache
+        # Hit on the sole entry: move_to_end keeps size at 1.
+        p._read("metrics.parquet", ["time", "metric"])
+        assert len(p._table_cache) == 1
+
+
+class TestMalformedParquet:
+    """Malformed-input robustness: the provider must NEVER raise on a bad file.
+
+    Each case mirrors the real on-disk layout (file under case_dir with the
+    exact filename the provider expects) but corrupts the contents / schema.
+    """
+
+    def test_missing_expected_column_returns_empty_result(self, tmp_path):
+        # metrics.parquet exists but lacks every column query_metrics reads.
+        _write_metrics_parquet(tmp_path, [{"unrelated": "x"}])
+        p = ParquetProvider(_synthetic_case(tmp_path))
+        out = p.query_metrics(MetricFilter(window=_WIDE_WINDOW))
+        assert out == []
+
+    def test_empty_table_returns_empty_result(self, tmp_path):
+        # 0-row parquet file -> structured-empty result, no crash.
+        _write_metrics_parquet(tmp_path, [])
+        p = ParquetProvider(_synthetic_case(tmp_path))
+        assert p.query_metrics(MetricFilter(window=_WIDE_WINDOW)) == []
+
+    def test_wrong_typed_json_column_does_not_crash(self, tmp_path):
+        # alerts.data is expected to be a JSON string; here it is an int list
+        # column (not a JSON string). The provider must parse gracefully and
+        # NOT raise; data degrades to {} (the documented graceful fallback).
+        path = tmp_path / "alerts.parquet"
+        table = pa.Table.from_arrays(
+            [
+                pa.array(["a1"], type=pa.string()),
+                pa.array(["2026-04-25T12:00:00Z"], type=pa.string()),
+                pa.array([[1, 2, 3]], type=pa.list_(pa.int64())),  # non-JSON column
+            ],
+            names=["id", "time", "data"],
+        )
+        pq.write_table(table, path)
+        p = ParquetProvider(_synthetic_case(tmp_path))
+        out = p.query_alerts(AlertFilter(window=_WIDE_WINDOW))
+        assert isinstance(out, list)
+        # Row passes filters; data column gracefully degrades to {}.
+        assert len(out) == 1
+        assert out[0].data == {}
+
+    def test_corrupt_parquet_file_returns_empty(self, tmp_path):
+        # Bytes that are NOT a valid parquet file -> empty result + no raise.
+        (tmp_path / "metrics.parquet").write_bytes(b"not a parquet file at all")
+        p = ParquetProvider(_synthetic_case(tmp_path))
+        assert p.query_metrics(MetricFilter(window=_WIDE_WINDOW)) == []
+
+    def test_corrupt_file_does_not_poison_cache(self, tmp_path):
+        # A corrupt file returns [] but must not cache a bad value that masks
+        # a later repair: after "repairing" the file on disk, a fresh read
+        # must see the new rows (corrupt reads are never cached).
+        path = tmp_path / "metrics.parquet"
+        path.write_bytes(b"garbage")
+        p = ParquetProvider(_synthetic_case(tmp_path))
+        assert p.query_metrics(MetricFilter(window=_WIDE_WINDOW)) == []
+        assert len(p._table_cache) == 0  # corrupt read is not cached
+        # Repair the file on disk.
+        path.unlink()
+        _write_metrics_parquet(tmp_path, [{"time": 1, "metric": "m", "value": 1.0}])
+        out = p.query_metrics(MetricFilter(window=_WIDE_WINDOW))
+        assert isinstance(out, list)
+
+
+# --------------------------------------------------------------------------- #
 # render
 # --------------------------------------------------------------------------- #
+@needs_t001
 class TestRender:
     def test_render_metrics(self, provider: ParquetProvider):
         ms = provider.query_metrics(MetricFilter(window=provider.window, limit=3))
