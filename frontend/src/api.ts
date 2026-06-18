@@ -140,9 +140,33 @@ export interface OpenStreamOptions {
    * callback is purely an extra *channel* to distinguish a transport drop from
    * a hard server error. If `runId` was not supplied, the argument is null and
    * the caller should fall back to the in-memory partial trace.
+   *
+   * Kept for backward compat with older callers. New callers should prefer
+   * {@link OpenStreamOptions.onRecover}, which fires on EVERY mid-run drop
+   * path (idle-timeout, transport-CLOSED, AND a server-sent `error` event),
+   * not only the transport-CLOSED branch.
    */
   onTransportClosed?: (runId: string | null) => void;
+  /**
+   * Resilience hook (preferred over {@link onTransportClosed}): invoked ONCE
+   * when the stream ends MID-RUN for ANY non-clean reason — idle-timeout
+   * (`stream idle …`), native transport-CLOSED (`stream closed …`), or a
+   * server-sent `error` event. In all three cases the live partial trace may
+   * be incomplete while a fuller, server-persisted trace could exist, so this
+   * is the single hook callers should use to best-effort fetch the persisted
+   * trace via {@link fetchRun}. It fires BEFORE the matching `onError` so a
+   * caller can kick off recovery before rendering the error banner.
+   *
+   * Passes the known `runId` (or null when none was supplied): when null the
+   * caller should fall back to the in-memory partial trace + an error banner.
+   * The recovery source tells the caller WHICH path dropped, in case it wants
+   * to differentiate the banner copy (e.g. idle vs transport vs server).
+   */
+  onRecover?: (runId: string | null, source: RecoverSource) => void;
 }
+
+/** Which drop path triggered an {@link OpenStreamOptions.onRecover} call. */
+export type RecoverSource = "idle" | "transport" | "server-error";
 
 /**
  * Handle returned by {@link openRcaStream}. Calling `dispose()` (or `close()`)
@@ -241,6 +265,10 @@ export function openRcaStream(
       idleTimer = null;
       if (terminated) return;
       try {
+        // Recover BEFORE onError so the caller can kick off fetchRun before
+        // it renders the error banner (idle drops are the #1 cause of losing
+        // an in-progress trace; the persisted trace recovery is the fix).
+        triggerRecover("idle");
         handlers.onError?.(`stream idle for case ${caseId} (no event in ${idleTimeoutMs}ms)`, {
           event: "error",
           case_id: caseId,
@@ -251,6 +279,34 @@ export function openRcaStream(
         disposeInternal();
       }
     }, idleTimeoutMs);
+  };
+
+  // Single fire of the persisted-trace recovery hook. Idempotent per stream
+  // (recoveryFired) so a server-error followed by a transport-CLOSED during
+  // teardown doesn't fire it twice. NOTE: we deliberately do NOT guard on
+  // `terminated` here — recovery is a TERMINAL event fired by the very paths
+  // that set terminated (idle timer / transport CLOSED / server error), and
+  // the transport-CLOSED branch calls disposeInternal BEFORE triggerRecover.
+  // Guarding on terminated would suppress the recovery the teardown-then-
+  // recover ordering relies on. The per-stream recoveryFired flag is the real
+  // idempotency fence. Fires BOTH onRecover (preferred, all paths) and
+  // onTransportClosed (back-compat, transport path only).
+  let recoveryFired = false;
+  const triggerRecover = (source: RecoverSource) => {
+    if (recoveryFired) return;
+    recoveryFired = true;
+    try {
+      options.onRecover?.(runId, source);
+    } catch {
+      // Best-effort: a throwing recovery hook must not suppress onError.
+    }
+    if (source === "transport") {
+      try {
+        options.onTransportClosed?.(runId);
+      } catch {
+        // Same best-effort contract as onRecover.
+      }
+    }
   };
 
   // Single source of truth for teardown. Cancels the watchdog, marks the
@@ -320,6 +376,10 @@ export function openRcaStream(
           (payload as { error?: string })?.error ??
           `stream error for case ${caseId}`;
         try {
+          // A server-sent error event is a mid-run drop too: the partial trace
+          // may be incomplete while the persisted one is fuller. Fire recovery
+          // before onError so the caller can fetch the persisted trace.
+          triggerRecover("server-error");
           handlers.onError?.(errMsg, envelope as SseEvent<{ error?: string }>);
         } finally {
           disposeInternal();
@@ -337,6 +397,21 @@ export function openRcaStream(
   (["step", "delta", "report", "done", "error", "ping"] as SseEventKind[]).forEach((k) => {
     es.addEventListener(k, makeListener(k) as EventListener);
   });
+
+  // Defense-in-depth: re-arm the idle watchdog on ANY message the browser
+  // delivers via the default `message` channel — i.e. SSE frames with NO
+  // `event:` field (data-only "unnamed" pings), which named addEventListener
+  // handlers never see. The server is expected to emit named `ping` events
+  // (and the listener above re-arms on those), but historically the server
+  // emitted data-only pings, and a future change could revert. Re-arming here
+  // makes the 60s watchdog robust to either format: it can NEVER fire while
+  // bytes are still arriving on the stream, regardless of how they're framed.
+  // We do NOT parse the payload — unnamed messages carry no typed envelope,
+  // and the only job here is to prove liveness.
+  es.onmessage = () => {
+    if (terminated) return;
+    rearmIdle();
+  };
 
   // If the transport itself fails (network down, non-200, CORS), EventSource
   // fires `error` and auto-retries while CONNECTING, then ends in CLOSED.
@@ -360,17 +435,14 @@ export function openRcaStream(
       nativeErrorSurfaced = true;
       // Teardown FIRST so neither user callback can leave the EventSource
       // open (matching the listener contract: disposeInternal runs before the
-      // user-facing terminal callback is invoked). Then fire BOTH callbacks
-      // independently — one throwing must not suppress the other, since they
-      // carry distinct signals (onTransportClosed => "try to fetch the
-      // persisted trace"; onError => "show the error banner").
+      // user-facing terminal callback is invoked). Then fire recovery +
+      // onError independently — one throwing must not suppress the other,
+      // since they carry distinct signals (onRecover/onTransportClosed =>
+      // "try to fetch the persisted trace"; onError => "show the error
+      // banner"). triggerRecover fans out to BOTH hooks (preferred onRecover
+      // + back-compat onTransportClosed) and is idempotent.
       disposeInternal(/* transport */);
-      try {
-        options.onTransportClosed?.(runId);
-      } catch {
-        // Swallow only here: onError below must still fire even if the
-        // resilience hook throws. The hook is best-effort by design.
-      }
+      triggerRecover("transport");
       handlers.onError?.(`stream closed for case ${caseId}`, {
         event: "error",
         case_id: caseId,

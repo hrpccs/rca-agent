@@ -77,4 +77,41 @@ describe("RunHistory", () => {
     // The time slot shows — when started_at is absent.
     expect(screen.getAllByText("—").length).toBeGreaterThan(0);
   });
+
+  it("renders an `interrupted` status with its own color class (distinct from error/completed)", () => {
+    // F2: interrupted (idle/transport drop) must be visually distinct from a
+    // hard error and from a clean completion. Assert the badge text AND that
+    // the dedicated CSS modifier class is applied.
+    const runs = [
+      run({ run_id: "r-int", status: "interrupted" }),
+      run({ run_id: "r-err", status: "error" }),
+      run({ run_id: "r-ok", status: "completed" }),
+    ];
+    const { container } = render(<RunHistory runs={runs} onSelectRun={() => {}} />);
+    expect(screen.getByText("interrupted")).toBeInTheDocument();
+    expect(screen.getByText("error")).toBeInTheDocument();
+    expect(screen.getByText("completed")).toBeInTheDocument();
+    // Each status gets its own modifier class.
+    expect(container.querySelector(".run-history__status--interrupted")).not.toBeNull();
+    expect(container.querySelector(".run-history__status--error")).not.toBeNull();
+    expect(container.querySelector(".run-history__status--completed")).not.toBeNull();
+  });
+
+  it("renders token usage compactly when the backend recorded it", () => {
+    // F2: the run panel surfaces token usage so the user can see the cost of
+    // each historical run. Large totals are formatted as "1.2k tok".
+    const runs = [
+      run({ run_id: "r-tok", token_usage: { total_tokens: 1234 } }),
+      run({ run_id: "r-small", token_usage: { total_tokens: 42 } }),
+    ];
+    render(<RunHistory runs={runs} onSelectRun={() => {}} />);
+    expect(screen.getByText("1.2k tok")).toBeInTheDocument();
+    expect(screen.getByText("42 tok")).toBeInTheDocument();
+  });
+
+  it("omits the token line when the backend recorded no usage", () => {
+    const runs = [run({ run_id: "r-notok", token_usage: null })];
+    const { container } = render(<RunHistory runs={runs} onSelectRun={() => {}} />);
+    expect(container.querySelector(".run-history__tokens")).toBeNull();
+  });
 });

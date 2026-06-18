@@ -199,10 +199,27 @@
 .run-history__status--error {
   color: var(--red);
   border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.12);
 }
 .run-history__status--running {
   color: var(--amber);
   border-color: rgba(245, 158, 11, 0.4);
+}
+/* `interrupted` = the run ended without a clean done (idle/transport drop).
+   Amber-red to read as "cut off" — distinct from hard `error` (solid red)
+   and from a clean `completed` (green). */
+.run-history__status--interrupted {
+  color: #f97316;
+  border-color: rgba(249, 115, 22, 0.5);
+  background: rgba(249, 115, 22, 0.12);
+}
+.run-history__status--truncated {
+  color: var(--amber);
+  border-color: rgba(245, 158, 11, 0.4);
+}
+.run-history__status--unknown {
+  color: var(--text-mute);
+  border-color: var(--border);
 }
 .run-history__meta {
   display: flex;
@@ -218,10 +235,22 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.run-history__id-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
 .run-history__steps {
   font-size: 10px;
   color: var(--text-mute);
   font-family: var(--mono);
+}
+.run-history__tokens {
+  font-size: 10px;
+  color: var(--text-mute);
+  font-family: var(--mono);
+  margin-left: auto;
 }
 .run-history__id {
   font-size: 10px;

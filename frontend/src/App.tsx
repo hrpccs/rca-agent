@@ -41,8 +41,10 @@ interface CaseTrace {
   replayingRunId: string | null;
   /**
    * Banner shown above the timeline for best-effort disconnect recovery
-   * ("connection lost — showing saved trace · retry"). Null when no such
-   * banner applies. Distinct from `error` (which is the hard-failure line).
+   * ("connection lost — loaded server-saved trace (N steps) · retry" when a
+   * persisted trace was fetched, or "connection lost — partial trace shown"
+   * when no runId/fetchRun was available). Null when no such banner applies.
+   * Distinct from `error` (which is the hard-failure line).
    */
   disconnectBanner: string | null;
   /**
@@ -352,12 +354,18 @@ export default function App() {
 
     eventSourceRef.current = openRcaStream(runCase, backend, handlers, {
       runId,
-      onTransportClosed: (knownRunId) => {
-        // The SSE transport dropped mid-run (native CLOSED). Best-effort fetch
-        // the persisted trace and replace what's shown so the user keeps their
-        // in-progress work instead of a bare error. Explicitly best-effort: if
-        // the network is also down (or no runId is known), we show the
-        // in-memory partial trace + a recovery banner.
+      // onRecover fires on EVERY mid-run drop path: idle-timeout (the most
+      // common — a long DeepSeek turn that stops emitting pings), transport
+      // CLOSED (network/CORS), and a server-sent error event. In all three
+      // cases the live partial trace may be incomplete while the server has a
+      // fuller persisted one, so we best-effort fetch it via fetchRun and show
+      // it + a banner instead of a bare broken timeline. This is the fix for
+      // "stream drops and the user sees an empty trace."
+      onRecover: (knownRunId) => {
+        // Best-effort fetch the persisted trace and replace what's shown so the
+        // user keeps their in-progress work instead of a bare error. Explicitly
+        // best-effort: if the network is also down (or no runId is known), we
+        // show the in-memory partial trace + a recovery banner.
         const recoverId = knownRunId ?? runId;
         if (!recoverId) {
           updateForCase(runCase, (t) => ({
@@ -371,6 +379,12 @@ export default function App() {
             // mountedRef guards the post-unmount write; runCase pins the target
             // so a case switch between drop and resolution can't misroute.
             if (!mountedRef.current) return;
+            // Build the recovery banner once: both the replay-shadow branch
+            // and the live-trace branch show the SAME banner (only the trace
+            // they write into differs), so we hoist it out of the branch to
+            // avoid the two copies drifting. 连接断开 — 已加载服务器保存的轨迹（N 步）· 重试
+            const stepWord = run.steps.length === 1 ? "step" : "steps";
+            const disconnectBanner = `connection lost — loaded server-saved trace (${run.steps.length} ${stepWord}) · retry · 连接断开，已加载服务器保存的轨迹（${run.steps.length} 步）`;
             updateForCase(runCase, (t) => {
               // Don't clobber a replay the user started after the drop: if a
               // replay is now active, write the recovery into the live shadow.
@@ -380,7 +394,7 @@ export default function App() {
                   liveSteps: run.steps.length > 0 ? run.steps : (t.liveSteps ?? []),
                   liveReport: extractReport(run) ?? t.liveReport,
                   liveStatus: run.status === "completed" ? "done" : "error",
-                  disconnectBanner: "connection lost — showing saved trace · retry · 连接中断，已显示保存的追踪",
+                  disconnectBanner,
                 };
               }
               return {
@@ -396,9 +410,12 @@ export default function App() {
                 // t.status (which onError may have already flipped to "error").
                 status: run.status === "completed" ? "done" : "error",
                 error: run.status === "completed" ? null : t.error,
-                disconnectBanner: "connection lost — showing saved trace · retry · 连接中断，已显示保存的追踪",
+                disconnectBanner,
               };
             });
+            // Refresh run history so the dropped run appears with its final
+            // status (the backend marks it interrupted/error on its side).
+            void loadRuns(runCase);
           })
           .catch(() => {
             if (!mountedRef.current) return;

@@ -422,6 +422,197 @@ describe("openRcaStream — inactivity watchdog", () => {
   });
 });
 
+/**
+ * Regression coverage for the F2 fixes:
+ *  (a) the idle watchdog is re-armed by an UNNAMED SSE message (no `event:`
+ *      field) via es.onmessage — defense-in-depth so the watchdog never fires
+ *      during an active stream regardless of the server's ping format.
+ *  (b) idle-drop AND server-error-drop (not just transport-CLOSED) trigger
+ *      the persisted-trace recovery hook (onRecover) when a runId is known.
+ *      This is the fix for "stream drops and the partial trace is lost."
+ */
+describe("openRcaStream — onmessage re-arm & drop recovery (F2)", () => {
+  let restore: () => void;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    const inst = installFakeEventSource();
+    restore = inst.cleanup;
+  });
+
+  afterEach(() => {
+    cleanup();
+    restore();
+    vi.useRealTimers();
+  });
+
+  it("re-arms the idle watchdog on an UNNAMED message (es.onmessage)", () => {
+    // This is the regression test that WAS MISSING: the old code only listened
+    // for named `ping` events and had no onmessage handler, so a data-only
+    // ping (no `event:` line) never re-armed the 60s watchdog and the stream
+    // was killed mid-turn during long DeepSeek responses.
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t-msg", "parquet", handlers, { idleTimeoutMs: 1000 });
+    const es = fakeEs(handle);
+
+    // Advance 800ms (under the 1000ms budget) then deliver an UNNAMED message
+    // directly to es.onmessage (what a real EventSource does for frames with
+    // no `event:` field). The watchdog must re-arm, so advancing another 800ms
+    // (which would total 1600ms > 1000ms from open) does NOT trip it.
+    act(() => {
+      vi.advanceTimersByTime(800);
+    });
+    act(() => {
+      // Simulate a data-only ping: the browser fires onmessage with the raw
+      // payload. We don't care about the data — only that it re-arms.
+      es.onmessage?.(new MessageEvent("message", { data: ":keep-alive" }));
+    });
+    act(() => {
+      vi.advanceTimersByTime(800);
+    });
+    expect(handlers.calls.onError).toHaveLength(0);
+    expect(es.isClosed()).toBe(false);
+    handle.dispose();
+  });
+
+  it("does not re-arm on onmessage after the stream is terminated (straggler guard)", () => {
+    // A straggler unnamed message delivered after done/dispose must not arm a
+    // fresh timer on a closed stream (would leak the timer + closure).
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t-msg-straggler", "parquet", handlers, { idleTimeoutMs: 1000 });
+    const es = fakeEs(handle);
+
+    es.dispatchEventMessage("done", envelope("done", "t-msg-straggler", {}, 1));
+    expect(es.isClosed()).toBe(true);
+
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    act(() => {
+      es.onmessage?.(new MessageEvent("message", { data: "late" }));
+    });
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("fires onRecover with the runId on an idle-timeout drop (not only transport-CLOSED)", () => {
+    // Regression test for bug #2: the idle-watchdog drop path must trigger the
+    // persisted-trace recovery hook, not just the transport-CLOSED path. Under
+    // the old code only onTransportClosed fired (and only on CLOSED), so an
+    // idle drop — the most common drop during long LLM turns — lost the trace.
+    const onRecover = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t-idle-rec", "parquet", handlers, {
+      idleTimeoutMs: 1000,
+      runId: "run-idle",
+      onRecover,
+    });
+    const es = fakeEs(handle);
+
+    act(() => {
+      vi.advanceTimersByTime(1001);
+    });
+
+    // idle fires both onError AND onRecover (recovery BEFORE error).
+    expect(handlers.calls.onError).toHaveLength(1);
+    expect(onRecover).toHaveBeenCalledTimes(1);
+    expect(onRecover).toHaveBeenCalledWith("run-idle", "idle");
+    expect(es.isClosed()).toBe(true);
+    handle.dispose();
+  });
+
+  it("fires onRecover with the runId on a server-sent error event (not only transport-CLOSED)", () => {
+    // Regression test for bug #2: a server `error` event must also trigger
+    // recovery. The partial live trace may be incomplete while the server has
+    // a fuller persisted one; the user should see the persisted trace + banner.
+    const onRecover = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t-err-rec", "parquet", handlers, {
+      runId: "run-err",
+      onRecover,
+    });
+    const es = fakeEs(handle);
+
+    es.dispatchEventMessage("error", envelope("error", "t-err-rec", { error: "boom" }, 5));
+
+    expect(handlers.calls.onError).toHaveLength(1);
+    expect(onRecover).toHaveBeenCalledTimes(1);
+    expect(onRecover).toHaveBeenCalledWith("run-err", "server-error");
+    expect(es.isClosed()).toBe(true);
+    handle.dispose();
+  });
+
+  it("fires onRecover with the runId on a transport-CLOSED drop (all three paths)", () => {
+    const onRecover = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t-tx-rec", "parquet", handlers, {
+      runId: "run-tx",
+      onRecover,
+    });
+    const es = fakeEs(handle);
+
+    es.simulateTransportError(true);
+
+    expect(onRecover).toHaveBeenCalledTimes(1);
+    expect(onRecover).toHaveBeenCalledWith("run-tx", "transport");
+    expect(handlers.calls.onError).toHaveLength(1);
+    handle.dispose();
+  });
+
+  it("fires onRecover with null when no runId was supplied (idle path)", () => {
+    const onRecover = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t-noid", "parquet", handlers, {
+      idleTimeoutMs: 1000,
+      onRecover,
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(1001);
+    });
+
+    expect(onRecover).toHaveBeenCalledWith(null, "idle");
+    handle.dispose();
+  });
+
+  it("does NOT fire onRecover on a clean done (only on drop paths)", () => {
+    const onRecover = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t-clean", "parquet", handlers, {
+      runId: "run-clean",
+      onRecover,
+    });
+    const es = fakeEs(handle);
+
+    es.dispatchEventMessage("done", envelope("done", "t-clean", {}, 1));
+    expect(onRecover).not.toHaveBeenCalled();
+    // And a spurious transport error after done must not fire it either.
+    es.simulateTransportError(true);
+    expect(onRecover).not.toHaveBeenCalled();
+    handle.dispose();
+  });
+
+  it("fires onRecover at most once (idempotent across idle-then-transport)", () => {
+    // If the idle timer fires and then a transport-CLOSED straggler arrives
+    // during teardown, recovery must fire exactly once (not twice).
+    const onRecover = vi.fn();
+    const handlers = makeHandlers();
+    const handle = openRcaStream("t-once", "parquet", handlers, {
+      idleTimeoutMs: 1000,
+      runId: "run-once",
+      onRecover,
+    });
+    const es = fakeEs(handle);
+
+    act(() => {
+      vi.advanceTimersByTime(1001);
+    });
+    // Spurious CLOSED during teardown.
+    es.simulateTransportError(true);
+
+    expect(onRecover).toHaveBeenCalledTimes(1);
+    handle.dispose();
+  });
+});
+
 describe("openRcaStream — run_id threading & onTransportClosed", () => {
   let restore: () => void;
   let originalFetch: typeof globalThis.fetch;
