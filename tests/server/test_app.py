@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -931,14 +932,19 @@ def test_list_case_runs_503_when_store_raises(client: TestClient):
 
 
 # --------------------------------------------------------------------------- #
-# Heartbeat regression — ping still emitted on a slow producer
+# Heartbeat regression — NAMED ping still emitted on a slow producer
 # --------------------------------------------------------------------------- #
 def test_heartbeat_ping_emitted_on_slow_producer(
     fake_store: FakeReportStore, fake_trace: FakeTraceStore, monkeypatch
 ):
     """A producer that sleeps longer than the heartbeat interval must yield at
-    least one ping before the first real event. Guards against regressing the
-    unnamed keepalive message that re-arms the client watchdog."""
+    least one ping before the first real event.
+
+    The ping MUST be a NAMED ``event: ping`` (not a data-only message): the
+    frontend listens via ``addEventListener("ping")`` and has no ``onmessage``
+    handler, so a data-only ping would be silently dropped and never re-arm the
+    client's idle watchdog. This is the regression that caused live idle
+    disconnects during long DeepSeek turns."""
     import asyncio
 
     set_case_lister(lambda: list(KNOWN_CASES))
@@ -971,27 +977,42 @@ def test_heartbeat_ping_emitted_on_slow_producer(
         set_agent_factory(None)
 
     events = _parse_sse_events(body)
-    # The ping is emitted as a data-only SSE message with no `event:` line, so
-    # its parsed event name is None and its data carries event=="ping".
-    pings = [
-        e for e in events if e["event"] is None and e["data"].get("event") == "ping"
+    # The ping MUST be NAMED: the parsed event name is "ping" (NOT None), and
+    # its data carries event=="ping". A data-only ping (event is None) would
+    # never fire the frontend's addEventListener("ping") and is the bug.
+    pings_named = [
+        e for e in events if e["event"] == "ping" and e["data"].get("event") == "ping"
     ]
-    assert pings, "expected at least one heartbeat ping before the first step"
+    assert pings_named, (
+        "expected at least one NAMED event:ping before the first step; a "
+        "data-only ping would be dropped by the frontend's listener"
+    )
+    # A data-only ping (the old buggy format) must NOT be present.
+    pings_unnamed = [
+        e
+        for e in events
+        if e["event"] is None and e["data"].get("event") == "ping"
+    ]
+    assert not pings_unnamed, "ping must be NAMED, not a data-only message"
     # The stream still terminates normally after the report.
     kinds = [e["event"] for e in events if e["event"] is not None]
     assert kinds[-1] == "done"
 
 
 # --------------------------------------------------------------------------- #
-# Regression: abandoned run is closed as 'truncated'; run_id threaded to
+# Regression: abandoned run is closed as 'interrupted'; run_id threaded to
 # save_report; finish_run not double-called.
 # --------------------------------------------------------------------------- #
-def test_stream_closes_run_as_truncated_when_producer_ends_without_report(
+def test_stream_closes_run_as_interrupted_when_producer_ends_without_report(
     client: TestClient, fake_trace: FakeTraceStore
 ):
     """A producer that yields steps then ends cleanly (no RcaReport, no
-    exception) must still close the run — as 'truncated' — so it does not linger
-    in 'running' forever. Guards against the abandoned-run leak."""
+    exception) must still close the run — as 'interrupted' — so it does not
+    linger in 'running' forever. Guards against the abandoned-run leak.
+
+    Status is 'interrupted' (NOT 'truncated'): 'truncated' is reserved for the
+    agent's own step-cap force-conclude, so ops can distinguish a stream that
+    was abandoned from one where the agent bailed at its step limit."""
 
     class NoReportAgent:
         async def run(self, case):
@@ -1012,10 +1033,10 @@ def test_stream_closes_run_as_truncated_when_producer_ends_without_report(
 
     # The one step was persisted.
     assert len(fake_trace.appended_steps) == 1
-    # Exactly one finish_run, with status 'truncated' (the abandoned-run closer
-    # in the finally block), NOT 'completed' and NOT zero calls.
+    # Exactly one finish_run, with status 'interrupted' (the abandoned-run
+    # closer in the finally block), NOT 'completed' and NOT zero calls.
     assert len(fake_trace.finished_runs) == 1
-    assert fake_trace.finished_runs[0] == (FIXED_RUN_ID, "truncated", None)
+    assert fake_trace.finished_runs[0] == (FIXED_RUN_ID, "interrupted", None)
 
 
 def test_stream_passes_run_id_to_save_report(
@@ -1047,7 +1068,7 @@ def test_stream_finish_run_called_exactly_once_on_error(
     client: TestClient, fake_trace: FakeTraceStore
 ):
     """The ERROR branch closes the run as 'error'; the finally closer must not
-    re-close it (would otherwise flip 'error' -> 'truncated')."""
+    re-close it (would otherwise flip 'error' -> 'interrupted')."""
 
     class RaisingAgent:
         async def run(self, case):
@@ -1068,3 +1089,345 @@ def test_stream_finish_run_called_exactly_once_on_error(
 
     assert len(fake_trace.finished_runs) == 1
     assert fake_trace.finished_runs[0] == (FIXED_RUN_ID, "error", None)
+
+
+# --------------------------------------------------------------------------- #
+# F1: SSE resilience — named ping, disconnect cleanup, orphan-run reaper
+# --------------------------------------------------------------------------- #
+def test_termination_status_report_completes_run(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    """REPORT branch stamps status='completed' (from the report's own status)."""
+    with client.stream(
+        "GET", f"/rca/t001/stream?run_id={FIXED_RUN_ID}"
+    ) as resp:
+        resp.read()
+    statuses = [s for _, s, _ in fake_trace.finished_runs]
+    assert statuses == ["completed"]
+
+
+def test_termination_status_truncated_when_report_says_truncated(
+    client: TestClient, fake_trace: FakeTraceStore
+):
+    """When the agent's own report carries status='truncated' (the step-cap
+    force-conclude path), the run is closed as 'truncated' — distinct from the
+    'interrupted' abandonment status. Proves the two paths are distinguishable."""
+
+    class TruncatedReportAgent:
+        async def run(self, case):
+            yield _scripted_trace("t001")[0]
+            rep = _scripted_trace("t001")[2]
+            rep.status = "truncated"
+            yield rep
+
+    def factory(case_id, backend=None, **kw):
+        return _fake_case(case_id), TruncatedReportAgent()
+
+    set_agent_factory(factory)
+    try:
+        with client.stream(
+            "GET", f"/rca/t001/stream?run_id={FIXED_RUN_ID}"
+        ) as resp:
+            resp.read()
+    finally:
+        set_agent_factory(None)
+
+    assert len(fake_trace.finished_runs) == 1
+    assert fake_trace.finished_runs[0][1] == "truncated"
+
+
+async def _drive_event_gen_then_aclose(case_id: str = "t001", run_id: str = FIXED_RUN_ID):
+    """Build the stream's inner ``event_gen`` via the real ``stream_rca``
+    endpoint and close it early (``.aclose()``) to simulate a client disconnect
+    mid-stream.
+
+    sse-starlette does not guarantee generator cancellation on disconnect, so
+    we cannot reliably reproduce the disconnect via TestClient. Instead we call
+    ``stream_rca`` directly (with a stub ``Request`` whose ``is_disconnected``
+    reports True) to get the ``EventSourceResponse``, drive its body iterator
+    one step, then ``.aclose()`` it — which triggers the ``finally`` exactly as
+    a GeneratorExit would in the real transport. This is the unit test that
+    would have caught the original 'run leaks as running on disconnect' bug.
+    """
+    # NOTE: ``rca_agent.server.__init__`` re-exports the FastAPI instance as
+    # ``app``, shadowing the submodule. Import the endpoint + setters by their
+    # explicit dotted path (see the module docstring at the top of this file).
+    from rca_agent.server.app import (
+        set_agent_factory,
+        set_case_lister,
+        set_report_store_factory,
+        set_trace_store_factory,
+        stream_rca,
+    )
+
+    # Scripted slow agent: yields one step then blocks forever (until closed).
+    class HangingAgent:
+        def __init__(self):
+            self.cancelled = False
+
+        async def run(self, case):
+            yield _scripted_trace(case_id)[0]
+            # Block until the generator is closed (CancelledError) — mimics a
+            # long DeepSeek turn in flight when the client drops.
+            try:
+                import asyncio as _aio
+
+                await _aio.Event().wait()
+            except BaseException:
+                self.cancelled = True
+                raise
+
+    hanging = HangingAgent()
+
+    def factory(cid, backend=None, **kw):
+        return _fake_case(cid), hanging
+
+    fake_trace_local = FakeTraceStore(run_id=run_id)
+    fake_report_local = FakeReportStore()
+    set_case_lister(lambda: list(KNOWN_CASES))
+    set_trace_store_factory(lambda: fake_trace_local)
+    set_report_store_factory(lambda: fake_report_local)
+    set_agent_factory(factory)
+    try:
+        # Stub Request whose is_disconnected() reports True so the heartbeat
+        # path breaks on the first silence — the primary F1 disconnect path.
+        class StubRequest:
+            async def is_disconnected(self):
+                return True
+
+        # stream_rca is an async endpoint returning EventSourceResponse. Call
+        # it to get the response, then pull its body iterator (which wraps the
+        # inner event_gen). Closing that iterator closes event_gen.
+        resp = await stream_rca(
+            StubRequest(),  # type: ignore[arg-type]
+            case_id=case_id,
+            run_id=run_id,
+        )
+        body_iter = resp.body_iterator
+        # Drive one real event (the step), then close mid-stream.
+        first = None
+        async for chunk in body_iter:
+            first = chunk
+            break
+        assert first is not None, "expected at least one step before close"
+        # Close mid-stream — simulates client disconnect.
+        if hasattr(body_iter, "aclose"):
+            await body_iter.aclose()
+    finally:
+        set_case_lister(None)
+        set_trace_store_factory(None)
+        set_report_store_factory(None)
+        set_agent_factory(None)
+    return fake_trace_local, hanging
+
+
+@pytest.mark.asyncio
+async def test_stream_disconnect_closes_run_as_interrupted_once():
+    """Client disconnect mid-stream (simulated via early ``.aclose()`` of the
+    response body iterator) must close the run exactly once as 'interrupted',
+    not leave it 'running' and not double-close. This is the regression test
+    for the live 'runs leak as running on disconnect' bug."""
+    fake_trace_local, hanging = await _drive_event_gen_then_aclose()
+    # The producer was cancelled (teardown did not outlive the request).
+    assert hanging.cancelled, "produce() task should have been cancelled on close"
+    # Exactly one finish_run, status 'interrupted' — NOT 'running' leak, NOT
+    # double-closed, NOT 'truncated' (that's the step-cap path).
+    assert len(fake_trace_local.finished_runs) == 1
+    assert fake_trace_local.finished_runs[0][1] == "interrupted"
+
+
+def test_reap_orphan_runs_closes_only_stale_running(monkeypatch):
+    """The orphan-run reaper closes only ``running`` rows older than the reap
+    age, with status 'interrupted', and leaves fresh/completed/errored rows
+    alone. Uses only the existing TraceStore methods (no mysql_store edit)."""
+    from rca_agent.server.app import _reap_orphan_runs
+
+    # Tight reap window so the test is deterministic: anything > 0.01 min
+    # (~0.6s) old is stale. Fresh rows are < that.
+    monkeypatch.setenv("RCA_RUN_REAP_MIN", "0.01")
+
+    store = FakeTraceStore()
+    now = datetime.now(UTC)
+
+    def _row(rid, status, started):
+        return {"run_id": rid, "case_id": "t001", "status": status,
+                "started_at": started}
+
+    store.run_rows = {
+        # stale + running -> reaped
+        "a" * 32: _row("a" * 32, "running", now - timedelta(minutes=5)),
+        # fresh + running -> left alone
+        "b" * 32: _row("b" * 32, "running", now),
+        # stale + completed -> left alone (not running)
+        "c" * 32: _row("c" * 32, "completed", now - timedelta(minutes=5)),
+        # stale + error -> left alone
+        "d" * 32: _row("d" * 32, "error", now - timedelta(minutes=5)),
+    }
+    # FakeTraceStore.list_runs ignores the case_id arg and returns all rows.
+
+    closed = _reap_orphan_runs(store)
+    assert closed == 1
+    statuses = {rid: r["status"] for rid, r in store.run_rows.items()}
+    assert statuses["a" * 32] == "interrupted"
+    assert statuses["b" * 32] == "running"
+    assert statuses["c" * 32] == "completed"
+    assert statuses["d" * 32] == "error"
+    # Exactly one finish_run call, against the stale running row.
+    assert len(store.finished_runs) == 1
+    assert store.finished_runs[0][0] == "a" * 32
+    assert store.finished_runs[0][1] == "interrupted"
+
+
+def test_reap_orphan_runs_robust_to_bad_started_at(monkeypatch):
+    """The reaper must never crash on a row with an unparseable/missing
+    ``started_at``; it skips that row and continues the sweep."""
+    from rca_agent.server.app import _reap_orphan_runs
+
+    monkeypatch.setenv("RCA_RUN_REAP_MIN", "0.01")
+    store = FakeTraceStore()
+    now = datetime.now(UTC)
+    store.run_rows = {
+        "a" * 32: {"run_id": "a" * 32, "status": "running",
+                   "started_at": "not-a-date"},
+        "b" * 32: {"run_id": "b" * 32, "status": "running", "started_at": None},
+        "c" * 32: {"run_id": "c" * 32, "status": "running",
+                   "started_at": now - timedelta(days=1)},
+        # missing started_at key entirely
+        "e" * 32: {"run_id": "e" * 32, "status": "running"},
+    }
+    # Should not raise; only the genuinely-old parseable row is reaped.
+    closed = _reap_orphan_runs(store)
+    assert closed == 1
+    assert store.run_rows["c" * 32]["status"] == "interrupted"
+    # The bad rows were left as running (skipped, not crashed).
+    assert store.run_rows["a" * 32]["status"] == "running"
+    assert store.run_rows["b" * 32]["status"] == "running"
+    assert store.run_rows["e" * 32]["status"] == "running"
+
+
+def test_reap_orphan_runs_accepts_iso_string_and_datetime(monkeypatch):
+    """``started_at`` may arrive as either an ISO string (MySQL driver) or a
+    datetime (in-memory fake); both must be parsed as UTC and aged correctly.
+    A trailing ``Z`` suffix (common from some drivers) must be tolerated."""
+    from rca_agent.server.app import _reap_orphan_runs
+
+    monkeypatch.setenv("RCA_RUN_REAP_MIN", "0.01")
+    store = FakeTraceStore()
+    old_str = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+    old_str_z = (
+        datetime.now(UTC) - timedelta(minutes=30) - timedelta(days=1)
+    ).isoformat().replace("+00:00", "Z")
+    old_dt = datetime.now(UTC) - timedelta(minutes=30)
+    store.run_rows = {
+        "a" * 32: {"run_id": "a" * 32, "status": "running",
+                   "started_at": old_str},
+        "b" * 32: {"run_id": "b" * 32, "status": "running",
+                   "started_at": old_str_z},
+        "c" * 32: {"run_id": "c" * 32, "status": "running",
+                   "started_at": old_dt},
+    }
+    closed = _reap_orphan_runs(store)
+    assert closed == 3
+    for rid in store.run_rows:
+        assert store.run_rows[rid]["status"] == "interrupted"
+
+
+def test_reap_orphan_runs_returns_zero_when_list_raises(monkeypatch):
+    """A store whose ``list_runs`` blows up must not propagate; the reaper
+    returns 0 and the app stays up."""
+    from rca_agent.server.app import _reap_orphan_runs
+
+    class BrokenStore:
+        def list_runs(self, case_id=None, limit=50):
+            raise RuntimeError("db down")
+
+    assert _reap_orphan_runs(BrokenStore()) == 0  # type: ignore[arg-type]
+
+
+def test_reap_orphan_runs_skips_rows_whose_finish_run_raises(monkeypatch):
+    """A row whose ``finish_run`` blows up is skipped; the sweep continues and
+    closes the next valid row."""
+    from rca_agent.server.app import _reap_orphan_runs
+
+    monkeypatch.setenv("RCA_RUN_REAP_MIN", "0.01")
+
+    class FlakeyStore:
+        def __init__(self):
+            self.calls = []
+
+        def list_runs(self, case_id=None, limit=50):
+            now = datetime.now(UTC)
+            return [
+                {"run_id": "x" * 32, "status": "running",
+                 "started_at": now - timedelta(minutes=5)},
+                {"run_id": "y" * 32, "status": "running",
+                 "started_at": now - timedelta(minutes=5)},
+            ]
+
+        def finish_run(self, run_id, status, token_usage=None):
+            self.calls.append(run_id)
+            if run_id == "x" * 32:
+                raise RuntimeError("transient")
+
+    store = FlakeyStore()
+    closed = _reap_orphan_runs(store)
+    # Only the second row closed (first raised); the sweep was not aborted.
+    assert closed == 1
+    assert store.calls == ["x" * 32, "y" * 32]
+
+
+def test_lifespan_starts_reaper_and_cleans_up():
+    """The FastAPI lifespan must start the periodic reaper on startup and
+    cancel it cleanly on shutdown (no leaked task, no crash if the store is
+    unavailable). Drives the lifespan context directly."""
+    import asyncio
+
+    from rca_agent.server.app import lifespan
+
+    # Inject a fake trace store so the startup sweep + periodic loop run
+    # against in-memory data, not a real DB.
+    fake = FakeTraceStore()
+    now = datetime.now(UTC)
+    # A stale running row the startup sweep should close immediately.
+    fake.run_rows = {"z" * 32: {"run_id": "z" * 32, "status": "running",
+                                "started_at": now - timedelta(minutes=30)}}
+    set_trace_store_factory(lambda: fake)
+    try:
+        async def run():
+            # Fast reaper interval so the test doesn't hang on sleep.
+            import os
+
+            os.environ["RCA_RUN_REAP_INTERVAL_SEC"] = "0.01"
+            os.environ["RCA_RUN_REAP_MIN"] = "0.01"
+            async with lifespan(fastapi_app):
+                # Startup sweep already ran synchronously inside __aenter__.
+                pass
+            os.environ.pop("RCA_RUN_REAP_INTERVAL_SEC", None)
+            os.environ.pop("RCA_RUN_REAP_MIN", None)
+
+        asyncio.run(run())
+    finally:
+        set_trace_store_factory(None)
+    # The stale row was reaped at startup.
+    assert fake.run_rows["z" * 32]["status"] == "interrupted"
+
+
+def test_lifespan_does_not_crash_when_store_unavailable():
+    """If the trace store can't be constructed (dev with no DB), lifespan must
+    still start the app — the reaper is best-effort."""
+    import asyncio
+
+    from rca_agent.server.app import lifespan
+
+    def exploding():
+        raise RuntimeError("no db")
+
+    set_trace_store_factory(exploding)
+    try:
+        async def run():
+            async with lifespan(fastapi_app):
+                pass
+
+        asyncio.run(run())  # must not raise
+    finally:
+        set_trace_store_factory(None)

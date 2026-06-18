@@ -20,9 +20,10 @@ import os
 import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
@@ -207,6 +208,157 @@ def _try_setup_otel() -> None:
         pass
 
 
+def _parse_started_at(value: Any) -> datetime | None:
+    """Coerce a run row's ``started_at`` to an aware UTC ``datetime``.
+
+    ``MysqlStore`` and the in-memory fake may emit either a timezone-aware
+    ``datetime`` or an ISO-8601 string (possibly with a trailing ``Z``). We
+    accept both, treat naive datetimes as UTC, and return ``None`` for anything
+    we cannot interpret so the reaper can skip the row defensively rather than
+    crash the app.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # ``fromisoformat`` in 3.11 accepts most ISO shapes, but not a bare
+        # trailing ``Z``; normalize it to ``+00:00`` so an ``...Z`` row is
+        # parsed as UTC rather than rejected.
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        # A naive datetime is ambiguous; assume the server's storage tz is UTC
+        # (the schema stores UTC). Stamping UTC is safer than leaving naive,
+        # which would crash arithmetic against ``datetime.now(UTC)``.
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var, falling back to ``default`` on missing/bad values.
+
+    A misconfigured value (e.g. ``RCA_RUN_REAP_MIN=10min``) must NOT kill the
+    reaper loop — parse once per use, warn on bad input, and keep running with
+    the default so the backstop stays armed.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "env %s=%r is not a float; using default %s", name, raw, default,
+            extra={"env": name, "value": raw},
+        )
+        return default
+    return val if val > 0 else default
+
+
+def _reap_orphan_runs(store: TraceStore) -> int:
+    """Close runs stuck in ``running`` past the reap age (backstop).
+
+    This is a safety net, NOT the primary cleanup path. The stream's ``finally``
+    block is supposed to close every run when the client disconnects (now using
+    an explicit ``request.is_disconnected()`` check). But sse-starlette does not
+    guarantee generator cancellation on disconnect, and the process can die
+    mid-run — so a row can be left ``running`` with steps already streamed and
+    then dropped. This reaper walks recent runs and marks the stale ``running``
+    ones as ``interrupted`` (NOT ``truncated``: ``truncated`` is reserved for the
+    agent's own step-cap force-conclude, so ops can distinguish "the agent
+    bailed at its step limit" from "the stream was abandoned").
+
+    Uses ONLY existing TraceStore read/close methods (no schema or store change).
+    Best-effort: each row is wrapped so a single bad row or a transient store
+    error never aborts the sweep or crashes the app. Returns the count closed.
+    """
+    max_age_min = _env_float("RCA_RUN_REAP_MIN", 10.0)
+    cutoff = datetime.now(UTC).timestamp() - max_age_min * 60
+    closed = 0
+    try:
+        # Newest-first store ordering means a very old orphan beyond this window
+        # could be missed on a deployment with many historical runs; the limit is
+        # intentionally generous. The per-request ``finally`` is the primary
+        # cleanup; this is just the backstop.
+        runs = store.list_runs(limit=2000)
+    except Exception as exc:
+        logger.warning(
+            "rca_reap_list_failed: %s: %s",
+            type(exc).__name__,
+            exc,
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        return 0
+    for row in runs:
+        try:
+            if not isinstance(row, dict):
+                continue
+            if row.get("status") != "running":
+                continue
+            run_id = row.get("run_id")
+            if not run_id:
+                continue
+            started = _parse_started_at(row.get("started_at"))
+            # ``started_at`` may be absent on a partial/legacy schema; if we
+            # can't tell the age, do NOT reap (avoids closing a fresh run that
+            # just hasn't had its timestamp filled in yet).
+            if started is None:
+                continue
+            if started.timestamp() > cutoff:
+                continue  # fresh — leave it alone
+            store.finish_run(run_id, "interrupted")
+            closed += 1
+            logger.info(
+                "rca_reap_closed run_id=%s: abandoned run older than %s min marked "
+                "'interrupted'",
+                run_id,
+                max_age_min,
+                extra={"run_id": run_id, "status": "interrupted"},
+            )
+        except Exception as exc:
+            # One bad row must not stop the sweep. Log and continue.
+            logger.warning(
+                "rca_reap_row_failed: %s: %s",
+                type(exc).__name__,
+                exc,
+                extra={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            continue
+    if closed:
+        logger.info("rca_reap_sweep closed %d abandoned run(s)", closed)
+    return closed
+
+
+async def _reaper_loop(store: TraceStore) -> None:
+    """Periodically sweep orphaned ``running`` runs.
+
+    Loops forever until cancelled by the lifespan shutdown. Each iteration is
+    fully wrapped so a transient failure in one sweep never kills the loop
+    (which would silently disable the backstop for the rest of the process
+    lifetime).
+    """
+    interval = _env_float("RCA_RUN_REAP_INTERVAL_SEC", 300.0)
+    while True:
+        try:
+            _reap_orphan_runs(store)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "rca_reaper_iteration_failed: %s: %s",
+                type(exc).__name__,
+                exc,
+                extra={"error": f"{type(exc).__name__}: {exc}"},
+            )
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _try_setup_otel()
@@ -216,7 +368,35 @@ async def lifespan(app: FastAPI):
         FastAPIInstrumentor.instrument_app(app)
     except Exception:
         pass
-    yield
+
+    # Orphan-run reaper: on startup, sweep once to clean up any runs left
+    # ``running`` by a previous (crashed/restarted) process, then schedule a
+    # periodic background sweep as a backstop for future stream-disconnect
+    # leaks that slip past the per-request ``finally`` cleanup. Wrapped so a
+    # store misconfiguration (e.g. no DB in dev) never prevents startup.
+    reaper_task: asyncio.Task[None] | None = None
+    try:
+        reaper_store = _trace_store_factory()
+        # Synchronous startup sweep — clears the slate before serving traffic.
+        _reap_orphan_runs(reaper_store)
+        reaper_task = asyncio.create_task(_reaper_loop(reaper_store))
+    except Exception as exc:
+        logger.warning(
+            "rca_reaper_init_failed (non-fatal): %s: %s",
+            type(exc).__name__,
+            exc,
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+
+    try:
+        yield
+    finally:
+        # Cancel the periodic reaper so shutdown is prompt and the task doesn't
+        # outlive the app. ``suppress(BaseException)`` swallows CancelledError.
+        if reaper_task is not None and not reaper_task.done():
+            reaper_task.cancel()
+            with suppress(BaseException):
+                await reaper_task
 
 
 app = FastAPI(title="RCA Agent", version="0.1.0", lifespan=lifespan)
@@ -290,6 +470,7 @@ def _sse(event: str, payload: dict | str, seq: int) -> dict:
 
 @app.get("/rca/{case_id}/stream")
 async def stream_rca(
+    request: Request,
     case_id: str,
     backend: str = Query(default="parquet"),
     run_id: str | None = Query(default=None),
@@ -305,11 +486,17 @@ async def stream_rca(
 
     # Keepalive: the client closes a stream that receives nothing for its idle
     # timeout. A long DeepSeek reasoning turn can exceed that window between
-    # steps, so we emit an unnamed SSE message every few seconds of silence to
-    # prove the connection is alive — an *unnamed* (data-only) message fires the
-    # browser's onmessage, which re-arms the client's watchdog. (Named events
-    # only fire a matching addEventListener; comment pings are discarded
-    # entirely by EventSource, so neither would help.) Tunable via env.
+    # steps, so we emit a heartbeat every few seconds of silence to prove the
+    # connection is alive.
+    #
+    # The heartbeat MUST be a NAMED ``event: ping`` (not a data-only message).
+    # The frontend listens via ``eventSource.addEventListener("ping", ...)`` and
+    # does NOT register an ``onmessage`` handler, so a data-only ping would be
+    # silently dropped by EventSource and never re-arm the client's idle
+    # watchdog — which is exactly the live bug: during a >60s DeepSeek turn the
+    # browser aborted the stream ("断链") because the unnamed pings never
+    # arrived at the listener. sse-starlette emits a named event only when the
+    # yield dict carries an ``"event"`` key, so we set it here. Tunable via env.
     heartbeat_interval = float(os.environ.get("RCA_SSE_HEARTBEAT_SEC", "15"))
 
     async def event_gen() -> AsyncIterator[dict]:
@@ -369,7 +556,16 @@ async def stream_rca(
         async def produce() -> None:
             """Drain the agent into the queue so the consumer can interleave
             heartbeats without cancelling an in-flight agent step (which
-            asyncio.wait_for on agent.__anext__ would do)."""
+            asyncio.wait_for on agent.__anext__ would do).
+
+            Note on cancellation: this task is cancelled on client disconnect
+            (see the ``finally`` below). ``async for`` raises CancelledError
+            into the agent; CancelledError is a BaseException, so the
+            ``except Exception`` here does NOT swallow it — it propagates to the
+            task and is consumed by ``with suppress(BaseException): await task``
+            in the finally. That is the desired behavior: the in-flight agent
+            run is actually torn down and does not outlive the request.
+            """
             try:
                 async for ev in agent.run(case):
                     await queue.put(ev)
@@ -386,11 +582,39 @@ async def stream_rca(
                         queue.get(), timeout=heartbeat_interval
                     )
                 except TimeoutError:
+                    # Heartbeat fired: the producer has been silent for
+                    # ``heartbeat_interval``. Before re-arming the watchdog
+                    # with a ping, check whether the client has actually gone
+                    # away. sse-starlette does not reliably cancel this
+                    # generator on disconnect, so without this explicit check
+                    # the stream (and the produce() task, and the run row)
+                    # would leak until the producer finished naturally — which
+                    # for a stuck DeepSeek turn may be never. Breaking here
+                    # forces the ``finally`` to run and tear down
+                    # deterministically. ``is_disconnected()`` is best-effort;
+                    # the finally is the backstop either way.
+                    if await request.is_disconnected():
+                        logger.info(
+                            "rca_stream_client_disconnect case_id=%s run_id=%s: "
+                            "client gone during heartbeat, closing stream",
+                            case_id,
+                            effective_run_id,
+                            extra={
+                                "case_id": case_id,
+                                "run_id": effective_run_id,
+                            },
+                        )
+                        break
                     seq += 1
+                    # NAMED ping: ``"event": "ping"`` MUST be present so the
+                    # frontend's ``addEventListener("ping")`` fires. The data
+                    # payload is an SSEEvent-shaped envelope (event/case_id/
+                    # data/seq) so a generic SSEEvent listener also works.
                     yield {
+                        "event": SSEEventKind.PING.value,
                         "data": json.dumps(
                             {
-                                "event": "ping",
+                                "event": SSEEventKind.PING.value,
                                 "case_id": case_id,
                                 "data": {},
                                 "seq": seq,
@@ -417,12 +641,21 @@ async def stream_rca(
                     # Best-effort: close the run as errored. Never let storage
                     # break the stream. ``run_closed`` is set regardless of
                     # whether finish_run succeeded: a failed close attempt must
-                    # NOT trigger a retry with a different status ("truncated"),
-                    # which would overwrite the real terminal condition.
+                    # NOT trigger a retry with a different status, which would
+                    # overwrite the real terminal condition.
                     if effective_run_id is not None and trace is not None:
                         run_closed = True
                         try:
                             trace.finish_run(effective_run_id, "error")
+                            logger.info(
+                                "rca_run_closed run_id=%s status=error "
+                                "(producer exception)",
+                                effective_run_id,
+                                extra={
+                                    "run_id": effective_run_id,
+                                    "status": "error",
+                                },
+                            )
                         except Exception as exc:
                             logger.warning(
                                 "rca_finish_run_error_failed case_id=%s "
@@ -480,6 +713,15 @@ async def stream_rca(
                         try:
                             trace.finish_run(
                                 effective_run_id, ev.status, ev.token_usage
+                            )
+                            logger.info(
+                                "rca_run_closed run_id=%s status=%s (report)",
+                                effective_run_id,
+                                ev.status,
+                                extra={
+                                    "run_id": effective_run_id,
+                                    "status": ev.status,
+                                },
                             )
                         except Exception as exc:
                             logger.warning(
@@ -563,27 +805,42 @@ async def stream_rca(
                 task.cancel()
             # Await the (possibly just-cancelled) producer task to consume its
             # CancelledError/exception so it never propagates out of the SSE
-            # generator or surfaces as an unawaited-coroutine warning.
+            # generator or surfaces as an unawaited-coroutine warning. This
+            # also ensures the in-flight agent run does not outlive the request
+            # — ``produce()`` observes the cancellation (CancelledError is a
+            # BaseException, so its ``except Exception`` does not swallow it)
+            # and its ``async for`` tears the agent down.
             with suppress(BaseException):
                 await task
             # Close an ABANDONED run: if the stream ended without a terminal
             # event (client disconnect / GeneratorExit, or a producer that
             # stopped cleanly without yielding an RcaReport), the run row would
-            # otherwise linger in ``running`` forever. Mark it ``truncated``
-            # exactly once — the terminal branches above set ``run_closed`` so
-            # we never double-close a run that already received its real
-            # status (completed | error). Best-effort; storage failure here is
-            # non-fatal (the stream is already ending).
+            # otherwise linger in ``running`` forever. Mark it ``interrupted``
+            # (NOT ``truncated``): ``truncated`` is reserved for the agent's
+            # own step-cap force-conclude, so ops can distinguish "the agent
+            # bailed at its step limit" from "the stream was abandoned". The
+            # ``run_closed`` guard ensures we never double-close a run that
+            # already received its real status (completed | error). Best-effort;
+            # storage failure here is non-fatal (the stream is already ending).
             if (
                 not run_closed
                 and effective_run_id is not None
                 and trace is not None
             ):
                 try:
-                    trace.finish_run(effective_run_id, "truncated")
+                    trace.finish_run(effective_run_id, "interrupted")
+                    logger.info(
+                        "rca_run_closed run_id=%s status=interrupted "
+                        "(stream abandoned / client disconnect)",
+                        effective_run_id,
+                        extra={
+                            "run_id": effective_run_id,
+                            "status": "interrupted",
+                        },
+                    )
                 except Exception as exc:
                     logger.warning(
-                        "rca_finish_run_truncated_failed case_id=%s "
+                        "rca_finish_run_interrupted_failed case_id=%s "
                         "run_id=%s: %s: %s",
                         case_id,
                         effective_run_id,
