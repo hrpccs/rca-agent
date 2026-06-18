@@ -280,4 +280,45 @@ variance + a noise-aware diff.
 **Continuous evaluation (E4):** a paced accrual loop runs ~2 new cases per
 ~30 min against the 102 valid cases, appending to `runs/` and re-running the
 analyzer + post-improvement baseline diff. It auto-expires after 7 days and
-stops accruing past a coverage target (~50 cases) to bound cost.
+stops accruing past a coverage target (~50 cases) to bound cost. (Paused during
+the skills change below so `runs/` stays a clean pre-skills baseline.)
+
+---
+
+## 7. Skills support (agentskills.io) — before/after
+
+Added Agent Skills support: a `SkillStore` discovers `skills/*/SKILL.md` (1
+bundled: `rca-diagnose` + 9 per-fault SOPs), a `SkillRecaller` maps the alert
+title → the single best SOP, and the agent injects that SOP into the **system
+prompt** at run start (harness-side activation — the spec permits
+keyword/matching; the agent has no file-read tool so tier-3 is harness-driven).
+Env-gated (`RCA_SKILLS_ENABLED`, default on) for ablation. The `loaded skill:
+rca-diagnose` display-only step fired in **8/8** runs.
+
+**Method:** re-ran the same diverse 8-case set (t002,t004,t010,t014,t020,t040,
+t060,t080) **twice** on the current code — skills ON (`runs_post_skills/`) and
+skills OFF (`runs_no_skills/`) — to isolate the skill effect from DeepSeek
+run-variance. Single-seed, so per-case cells are noisy; the **aggregate
+direction** is the reliable signal.
+
+| metric (8 cases) | pre-skills (`runs/`) | skills-OFF ablation | **skills-ON** | ON vs OFF |
+|---|---|---|---|---|
+| avg confidence | 0.70 | 0.80 | **0.90** | **+0.10** |
+| avg steps | 90.6 | 87.5 | **80.0** | **−8%** |
+| avg tool calls | 35.8 | 35.0 | **31.5** | **−10%** |
+| avg tokens | 655K | 594K | **508K** | **−14%** |
+| convergence | 7/8 | 7/8 | 7/8 | same |
+
+**Result:** with the matched SOP injected, the agent investigates **more
+efficiently** (−14% tokens, −10% tool calls, −8% steps) and **more confidently**
+(+0.10 avg) — directly addressing the "reasoning too long / context-heavy"
+finding from §3.3. Standout: **t080** went truncated (0.0/no-answer) → completed
+**0.92** with skills on. Hard cases (t020, t060) remain token-heavy (~800K+) —
+the skill helps the agent target, but doesn't cap the hardest investigations
+(that's the §4 context-bounding lever, still opt-in/off by default).
+
+**Caveat (unchanged):** higher confidence is a *behavioral* gain, not proven
+higher *accuracy* — there is still no ground truth (§1, §4 P0). The efficiency
+gain is the robust takeaway. Post-skills baseline:
+`eval_baselines/baseline-2026-06-18-skills.json` (completed-only: conf 0.90,
+74.6 steps, 29.6 tools, 471K tokens).

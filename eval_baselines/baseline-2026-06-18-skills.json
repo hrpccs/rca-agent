@@ -1,0 +1,85 @@
+{
+  "metadata": {
+    "date": "2026-06-18",
+    "label": "skills-ON (rca-diagnose SOP injection)",
+    "model": "deepseek-reasoner",
+    "backend": "parquet",
+    "git_sha": "9d07ee5",
+    "note": "8-case skills-ON re-run vs skills-OFF ablation. Skill step fired in 8/8. Single-seed -> noisy per-case; aggregate direction reliable."
+  },
+  "aggregate": {
+    "n_cases": 8,
+    "n_completed": 7,
+    "n_truncated": 1,
+    "avg_confidence": 0.9,
+    "avg_steps": 74.57,
+    "avg_tool_calls": 29.57,
+    "avg_total_tokens": 471478.86
+  },
+  "per_case": [
+    {
+      "case_id": "t002",
+      "status": "completed",
+      "confidence": 0.95,
+      "n_steps": 32,
+      "n_tool_calls": 12,
+      "total_tokens": 192876
+    },
+    {
+      "case_id": "t004",
+      "status": "completed",
+      "confidence": 0.85,
+      "n_steps": 102,
+      "n_tool_calls": 42,
+      "total_tokens": 804936
+    },
+    {
+      "case_id": "t010",
+      "status": "completed",
+      "confidence": 0.92,
+      "n_steps": 45,
+      "n_tool_calls": 17,
+      "total_tokens": 275943
+    },
+    {
+      "case_id": "t014",
+      "status": "completed",
+      "confidence": 0.95,
+      "n_steps": 42,
+      "n_tool_calls": 16,
+      "total_tokens": 191154
+    },
+    {
+      "case_id": "t020",
+      "status": "completed",
+      "confidence": 0.85,
+      "n_steps": 114,
+      "n_tool_calls": 46,
+      "total_tokens": 876626
+    },
+    {
+      "case_id": "t040",
+      "status": "completed",
+      "confidence": 0.85,
+      "n_steps": 94,
+      "n_tool_calls": 37,
+      "total_tokens": 444582
+    },
+    {
+      "case_id": "t060",
+      "status": "truncated",
+      "confidence": 0.7,
+      "n_steps": 118,
+      "n_tool_calls": 45,
+      "total_tokens": 767346
+    },
+    {
+      "case_id": "t080",
+      "status": "completed",
+      "confidence": 0.92,
+      "n_steps": 93,
+      "n_tool_calls": 37,
+      "total_tokens": 514235
+    }
+  ]
+}
