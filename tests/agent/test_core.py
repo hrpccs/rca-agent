@@ -886,3 +886,318 @@ async def test_force_conclude_not_invoked_when_run_completes_normally(sample_cas
 
     # Only the two budgeted turns ran — no forced third call.
     assert llm.calls == 2
+
+
+# --------------------------------------------------------------------------- #
+# S4: skill recall + injection into the system prompt.
+# The skills engine (S1 store + S2 recall + S3 content) is wired into run()
+# so the single best troubleshooting SOP for the alert is injected into the
+# SYSTEM message (durable + compaction-protected) and a compact catalog is
+# disclosed. Env-gated (RCA_SKILLS_ENABLED) for before/after ablation.
+# --------------------------------------------------------------------------- #
+
+
+class _StaticSkillLibrary:
+    """Duck-typed SkillLibrary fake: returns a fixed match + catalog.
+
+    Used to assert the injected system-prompt block and the display-only step
+    without depending on the real engine's scoring details.
+    """
+
+    def __init__(
+        self,
+        match: tuple[str, str] | None = ("myskill", "SOP BODY TEXT"),
+        catalog: list[tuple[str, str]] | None = None,
+    ) -> None:
+        self._match = match
+        self._catalog = catalog if catalog is not None else [
+            ("myskill", "my skill description"),
+            ("other", "another skill"),
+        ]
+        self.best_for_calls: list[str] = []
+        self.catalog_calls = 0
+
+    def catalog(self) -> list[tuple[str, str]]:
+        self.catalog_calls += 1
+        return list(self._catalog)
+
+    def best_for(self, alert_title, signals=None):
+        self.best_for_calls.append(alert_title)
+        return self._match
+
+
+class _ThrowingSkillLibrary:
+    """A SkillLibrary whose best_for always raises — exercises that a throwing
+    recaller cannot abort the run."""
+
+    def catalog(self) -> list[tuple[str, str]]:
+        return [("x", "y")]
+
+    def best_for(self, alert_title, signals=None):
+        raise RuntimeError("recall engine exploded")
+
+
+def _system_text(req) -> str:
+    """Extract the system message content from a recorded LLMRequest."""
+    # messages[0] is always the system message (ContextManager.assemble_turn).
+    msgs = req.messages
+    assert msgs, "no messages in LLMRequest"
+    first = msgs[0]
+    return first.get("content", "") if isinstance(first, dict) else ""
+
+
+@pytest.mark.asyncio
+async def test_real_skill_library_injects_matched_sop_into_system_prompt(sample_case):
+    """Smoke against the REAL engine: SkillRecaller(SkillStore()) routes the
+    'checkout 错误次数告警' alert to rca-diagnose and injects its body + a
+    catalog into the system prompt. Uses a recording fake LLM so no real
+    DeepSeek call is made."""
+    from rca_agent.skills.recall import SkillRecaller
+    from rca_agent.skills.store import SkillStore
+
+    lib = SkillRecaller(SkillStore())
+    llm = _RecordingLLMBase()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=5, skill_library=lib,
+    )
+    _ = [e async for e in agent.run(sample_case)]
+
+    assert llm.received, "LLM was never called"
+    sys_text = _system_text(llm.received[0])
+    assert '<loaded_skill name="rca-diagnose">' in sys_text
+    assert "</loaded_skill>" in sys_text
+    # The matched SOP body must be present (the signal-router body).
+    assert "信号路由" in sys_text or "六维信号" in sys_text
+    # Tier-1 catalog disclosure.
+    assert "<available_skills>" in sys_text
+    assert "</available_skills>" in sys_text
+    assert "rca-diagnose" in sys_text
+
+
+@pytest.mark.asyncio
+async def test_fake_skill_library_injects_body_and_emits_display_step(sample_case):
+    """A fake SkillLibrary whose best_for returns ('myskill', 'SOP BODY TEXT')
+    must land the body + a <loaded_skill> tag in the system prompt, yield a
+    'loaded skill: myskill' REASONING step, and that step must NOT leak into
+    the LLM's received messages (display-only)."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    lib = _StaticSkillLibrary()
+    llm = _RecordingLLMBase()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=5, skill_library=lib,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    # best_for was called with the alert title.
+    assert lib.best_for_calls == [sample_case.task.alert_title]
+
+    # System prompt carries the injected block.
+    sys_text = _system_text(llm.received[0])
+    assert "SOP BODY TEXT" in sys_text
+    assert '<loaded_skill name="myskill">' in sys_text
+    assert "<available_skills>" in sys_text
+    assert "myskill: my skill description" in sys_text
+
+    # A 'loaded skill: myskill' REASONING step was yielded.
+    skill_steps = [
+        s for s in steps
+        if s.step_kind == StepKind.REASONING
+        and (s.thought or "").startswith("loaded skill:")
+    ]
+    assert skill_steps, "no 'loaded skill' display step yielded"
+    assert "myskill" in skill_steps[0].thought
+
+    # The display-only step is NOT in the LLM's received messages: concatenate
+    # every message the model saw and assert the thought text is absent.
+    forbidden = "loaded skill: myskill"
+    for req in llm.received:
+        blob = json.dumps(req.messages, ensure_ascii=False, default=str)
+        assert forbidden not in blob, (
+            f"display-only skill step leaked into LLM messages: {blob[:200]}"
+        )
+
+    # Regression: the run still completes normally.
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports and reports[-1].status == "completed"
+    assert skill_steps[0].step_id in {s.step_id for s in reports[-1].steps}
+
+
+@pytest.mark.asyncio
+async def test_skill_library_none_when_env_gate_off(sample_case, monkeypatch):
+    """RCA_SKILLS_ENABLED=0 -> _default_skill_library() returns None; a run
+    with the default library produces a system message with NO <loaded_skill>
+    and NO 'loaded skill' step — behavior identical to pre-skills."""
+    from rca_agent.agent.core import _default_skill_library, _skills_enabled
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    monkeypatch.setenv("RCA_SKILLS_ENABLED", "0")
+    assert _skills_enabled() is False
+    assert _default_skill_library() is None
+
+    llm = _RecordingLLMBase()
+    # No skill_library passed -> defaults to _default_skill_library() -> None.
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=5,
+    )
+    assert agent.skill_library is None
+
+    events = [e async for e in agent.run(sample_case)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    sys_text = _system_text(llm.received[0])
+    assert "<loaded_skill" not in sys_text
+    assert "<available_skills>" not in sys_text
+    assert not any(
+        s.step_kind == StepKind.REASONING
+        and (s.thought or "").startswith("loaded skill:")
+        for s in steps
+    ), "skill step yielded despite env gate OFF"
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports and reports[-1].status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_throwing_skill_library_does_not_crash_run(sample_case):
+    """A SkillLibrary whose best_for raises must not abort the run: no
+    <loaded_skill> in the system prompt, no 'loaded skill' step, status
+    completed."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    lib = _ThrowingSkillLibrary()
+    llm = _RecordingLLMBase()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=5, skill_library=lib,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    sys_text = _system_text(llm.received[0])
+    # best_for threw -> no loaded_skill tag; catalog() still works so the
+    # catalog MAY be present, but the loaded-SOP block must be absent.
+    assert "<loaded_skill" not in sys_text
+    assert not any(
+        s.step_kind == StepKind.REASONING
+        and (s.thought or "").startswith("loaded skill:")
+        for s in steps
+    )
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports, "throwing skill library crashed the run"
+    assert reports[-1].status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_skill_no_match_yields_no_block_but_run_continues(sample_case):
+    """When best_for returns None (no SOP above threshold), no <loaded_skill>
+    is injected and no display step is yielded, but the catalog may still be
+    disclosed and the run completes."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    lib = _StaticSkillLibrary(match=None)
+    llm = _RecordingLLMBase()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=5, skill_library=lib,
+    )
+    events = [e async for e in agent.run(sample_case)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    sys_text = _system_text(llm.received[0])
+    assert "<loaded_skill" not in sys_text
+    # Catalog disclosure still appears (best_for=None doesn't disable catalog).
+    assert "<available_skills>" in sys_text
+    assert not any(
+        s.step_kind == StepKind.REASONING
+        and (s.thought or "").startswith("loaded skill:")
+        for s in steps
+    )
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports and reports[-1].status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_malformed_skill_match_does_not_crash_run(sample_case):
+    """A SkillLibrary whose best_for returns a wrong-arity tuple (e.g. a
+    3-tuple) must not abort the run — the unpack is guarded so a malformed
+    match yields no <loaded_skill> and the run completes normally. Locks the
+    'Never raises' contract of _build_skill_block."""
+    from rca_agent.contracts import RcaReport, RcaStep, StepKind
+
+    class _MalformedLibrary:
+        def catalog(self):
+            return [("x", "y")]
+
+        def best_for(self, alert_title, signals=None):
+            # Wrong arity: 3-tuple instead of 2-tuple.
+            return ("name", "body", "extra")
+
+    llm = _RecordingLLMBase()
+    agent = RcaAgent(
+        provider=FakeProvider(), llm=llm, memory=InMemoryStore(),
+        context_manager=build_context_manager(),
+        tools=build_default_tools(FakeProvider(), InMemoryStore()),
+        max_steps=5, skill_library=_MalformedLibrary(),
+    )
+    events = [e async for e in agent.run(sample_case)]
+    steps = [e for e in events if isinstance(e, RcaStep)]
+
+    sys_text = _system_text(llm.received[0])
+    # Malformed match -> no loaded_skill block injected.
+    assert "<loaded_skill" not in sys_text
+    assert not any(
+        s.step_kind == StepKind.REASONING
+        and (s.thought or "").startswith("loaded skill:")
+        for s in steps
+    )
+    reports = [e for e in events if isinstance(e, RcaReport)]
+    assert reports, "malformed match crashed the run"
+    assert reports[-1].status == "completed"
+
+
+def test_skills_env_gate_parsing(monkeypatch):
+    """_skills_enabled accepts the documented disable spellings and defaults ON."""
+    from rca_agent.agent.core import _skills_enabled
+
+    # Default ON when unset.
+    monkeypatch.delenv("RCA_SKILLS_ENABLED", raising=False)
+    assert _skills_enabled() is True
+
+    # Falsy spellings -> OFF.
+    for off in ("0", "false", "FALSE", "no", "off", "  ", "Off"):
+        monkeypatch.setenv("RCA_SKILLS_ENABLED", off)
+        assert _skills_enabled() is False, f"{off!r} should disable"
+
+    # Anything else -> ON (safe default).
+    for on in ("1", "true", "yes", "on", "enable", "typo"):
+        monkeypatch.setenv("RCA_SKILLS_ENABLED", on)
+        assert _skills_enabled() is True, f"{on!r} should enable"
+
+
+def test_default_skill_library_returns_real_engine_when_enabled():
+    """With the env gate ON (default), _default_skill_library() returns a real
+    SkillRecaller whose best_for routes the checkout error alert to
+    rca-diagnose."""
+    from rca_agent.agent.core import _default_skill_library
+
+    # Env unset in this test's isolation -> default ON.
+    lib = _default_skill_library()
+    assert lib is not None
+    match = lib.best_for("checkout 错误次数告警")
+    assert match is not None
+    assert match[0] == "rca-diagnose"
+    assert match[1]  # non-empty body

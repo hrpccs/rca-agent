@@ -15,11 +15,22 @@ from typing import Any
 from ..contracts import RootCause, Task, Topology
 
 
-def build_initial_brief(task: Task, topology: Topology | None, memory_hits: list[Any]) -> str:
+def build_initial_brief(
+    task: Task,
+    topology: Topology | None,
+    memory_hits: list[Any],
+    *,
+    skill_name: str | None = None,
+) -> str:
     """The first user message: the alert under investigation + context.
 
     Includes the alert title/window/entity, the available modalities, a one-line
     topology summary, and any retrieved memory (runbook/domain knowledge).
+
+    ``skill_name`` (S4): when set, prepends a one-line pointer to the loaded
+    SOP so the model notices the per-fault-type procedure injected into the
+    system prompt. Keyword-only so every existing positional caller is
+    unchanged (default ``None`` → no pointer line, byte-identical output).
     """
     w = task.alert_window
     ent = task.alert_entity or {}
@@ -54,7 +65,18 @@ def build_initial_brief(task: Task, topology: Topology | None, memory_hits: list
 
     modalities = ", ".join(m.value for m in (task.available_modalities or [])) or "all"
 
+    # S4: one-line pointer to the loaded SOP (in the system prompt) so the
+    # model actively follows the per-fault-type procedure instead of ignoring
+    # the injected block. Only prepended when a skill was loaded.
+    skill_ptr = ""
+    if skill_name:
+        skill_ptr = (
+            f"已加载排查 SOP: {skill_name}（见系统提示）/ "
+            f"Loaded SOP: {skill_name} (see system prompt)\n"
+        )
+
     return (
+        f"{skill_ptr}"
         f"请分析以下告警的根因。\n"
         f"任务 / task_id: {task.task_id}\n"
         f"告警 / alert: {task.alert_title}\n"
