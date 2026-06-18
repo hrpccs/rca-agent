@@ -335,7 +335,7 @@ describe("App — per-case trace cache & disconnect recovery", () => {
 
     // App should best-effort fetch the persisted trace and show it + the banner.
     await waitFor(() =>
-      expect(screen.getByText(/connection lost — showing saved trace/i)).toBeInTheDocument(),
+      expect(screen.getByText(/connection lost — loaded server-saved trace/i)).toBeInTheDocument(),
     );
     await waitFor(() =>
       expect(screen.getByText("persisted-trace-after-drop")).toBeInTheDocument(),
@@ -440,7 +440,61 @@ describe("App — per-case trace cache & disconnect recovery", () => {
     await waitFor(() =>
       expect(screen.getByText("t040-recovered-marker")).toBeInTheDocument(),
     );
-    expect(screen.getByText(/connection lost — showing saved trace/i)).toBeInTheDocument();
+    expect(screen.getByText(/connection lost — loaded server-saved trace/i)).toBeInTheDocument();
+  });
+
+  it("on an idle-drop with a known runId, fetches the persisted trace and shows the recovery banner (F2)", async () => {
+    // Regression test for bug #2: the IDLE-watchdog drop path (the most common
+    // drop during long DeepSeek turns) must trigger persisted-trace recovery,
+    // not just the transport-CLOSED path. Under the old code only
+    // onTransportClosed fired, so an idle drop showed an empty timeline
+    // instead of the server-saved trace. The default idle timeout is 60s; we
+    // drive it by advancing fake timers past the window.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mockFetchAll({
+      cases: ["t050"],
+      runIdFor: () => "run-idle-drop",
+      runDetail: () => ({
+        run: {
+          run_id: "run-idle-drop",
+          case_id: "t050",
+          status: "interrupted",
+          step_count: 1,
+        },
+        steps: [
+          {
+            step_id: "s-idle-persisted",
+            case_id: "t050",
+            step_kind: "reasoning",
+            thought: "idle-drop-persisted-trace",
+          },
+        ],
+      }),
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("t050")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("t050"));
+    fireEvent.click(screen.getByRole("button", { name: /Run RCA/i }));
+    await waitFor(() => expect(fakeEventSourcesCreated.length).toBeGreaterThanOrEqual(1));
+    latestEs().simulateOpen();
+
+    // Advance past the 60s idle window with NO events delivered -> the
+    // watchdog fires, which must kick off fetchRun("run-idle-drop").
+    act(() => {
+      vi.advanceTimersByTime(60_500);
+    });
+
+    // The persisted trace + bilingual banner must appear (not an empty timeline).
+    await waitFor(() =>
+      expect(screen.getByText(/connection lost — loaded server-saved trace/i)).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("idle-drop-persisted-trace")).toBeInTheDocument(),
+    );
+    // The banner reports the persisted step count (scoped to the banner text
+    // so it doesn't collide with the RunHistory row that also shows "1 step").
+    expect(screen.getByText(/server-saved trace \(1 step\)/i)).toBeInTheDocument();
   });
 
   it("flips status to running as soon as POST /rca resolves (not only on first step)", async () => {

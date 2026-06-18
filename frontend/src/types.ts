@@ -60,8 +60,23 @@ export interface TokenUsage {
   [k: string]: unknown;
 }
 
-/** Run status. */
-export type ReportStatus = "completed" | "truncated" | "error" | string;
+/**
+ * Run status. Mirrors the backend's run-row status field. `interrupted` is
+ * emitted when a run ended without a clean `done` (idle-drop, transport drop,
+ * or a server-side cancel) — distinct from `error` (a hard failure) and
+ * `truncated` (the agent hit its step budget). Kept permissive (`| string`)
+ * so unknown backend statuses don't break the union at the type boundary.
+ *
+ * NOTE: the literal members are listed for IDE autocomplete/documentation of
+ * the known statuses; because `string` is in the union, assignment of any
+ * string is accepted (the literals don't narrow the effective type).
+ */
+export type ReportStatus =
+  | "completed"
+  | "truncated"
+  | "interrupted"
+  | "error"
+  | string;
 
 /** The final RCA report. Mirrors contracts.RcaReport. */
 export interface RcaReport {
