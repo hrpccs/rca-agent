@@ -563,3 +563,35 @@ def test_brief_modalities_default_all_when_empty():
     brief = build_initial_brief(task, None, [])
     # empty modalities list → "all"
     assert "modalities: all" in brief.lower()
+
+
+# --------------------------------------------------------------------------- #
+# S4: skill_name pointer (keyword-only, backward-compatible)
+# --------------------------------------------------------------------------- #
+def test_brief_skill_name_pointer_prepended():
+    """When skill_name is set, a one-line 'Loaded SOP' pointer is prepended."""
+    task = _task()
+    brief = build_initial_brief(task, None, [], skill_name="myskill")
+    assert brief.startswith("已加载排查 SOP: myskill")
+    assert "Loaded SOP: myskill (see system prompt)" in brief
+    # The rest of the brief is unchanged.
+    assert task.alert_title in brief
+    assert task.task_id in brief
+
+
+def test_brief_skill_name_none_is_byte_identical_to_omitted():
+    """Passing skill_name=None (the default) must produce byte-identical output
+    to not passing the arg at all — so every existing caller is unaffected."""
+    task = _task()
+    a = build_initial_brief(task, None, [])
+    b = build_initial_brief(task, None, [], skill_name=None)
+    assert a == b
+    assert "Loaded SOP" not in a
+    assert "已加载排查 SOP" not in a
+
+
+def test_brief_skill_name_keyword_only():
+    """skill_name is keyword-only: passing it positionally must TypeError."""
+    task = _task()
+    with pytest.raises(TypeError):
+        build_initial_brief(task, None, [], "myskill")  # type: ignore[misc]

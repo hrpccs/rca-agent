@@ -17,7 +17,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from ..cases import load_case
 from ..config import Settings, get_settings
@@ -44,6 +44,84 @@ GLOBAL = "__global__"
 _SEED_DIR = Path(__file__).resolve().parents[2] / "memory" / "seed"
 
 logger = logging.getLogger(__name__)
+
+# S4 — Skills integration env gate.
+# The skills engine (S1 store + S2 recall + S3 content) is wired into the
+# ReAct loop via this knob. Defaults ON (``"1"``) so a fresh checkout benefits
+# from per-fault-type SOP injection; OFF values (``0``/``false``/``no``/``off``)
+# reproduce the EXACT pre-skills agent behavior — essential for before/after
+# ablation runs. Parsed via the same ``os.environ.get`` idiom used by
+# ``RCA_FORCE_CONCLUDE`` above and sibling numeric knobs; NOT a config.py field
+# so the frozen config surface is untouched.
+_SKILLS_ENABLED_ENV = "RCA_SKILLS_ENABLED"
+
+
+@runtime_checkable
+class SkillLibrary(Protocol):
+    """Structural seam for the skills engine the agent recalls SOPs from.
+
+    ``SkillRecaller`` (from :mod:`rca_agent.skills.recall`) already satisfies
+    this Protocol structurally — it exposes both ``catalog()`` and
+    ``best_for()``. Declared as a Protocol (not a concrete import) so the agent
+    core stays decoupled from the skills package at the type level: tests can
+    inject any duck-typed fake, and a misconfigured/missing engine never breaks
+    the import graph. Runtime-checkable so ``isinstance`` works in tests.
+    """
+
+    def catalog(self) -> list[tuple[str, str]]:
+        """Return ``[(name, description), ...]`` for the catalog disclosure."""
+        ...
+
+    def best_for(
+        self, alert_title: str, signals: list[str] | None = None
+    ) -> tuple[str, str] | None:
+        """Return ``(skill_name, sop_body)`` for the best-matched SOP, or None."""
+        ...
+
+
+def _skills_enabled() -> bool:
+    """Read ``RCA_SKILLS_ENABLED``; default ON, falsy values disable.
+
+    Mirrors ``_force_conclude_enabled``'s idiom: OFF when the value is empty or
+    one of ``0``/``false``/``no``/``off`` (case-insensitive). Anything else
+    (including the unset default) enables skills — the safer default, since an
+    unset env var should not silently regress SOP injection.
+    """
+    raw = os.environ.get(_SKILLS_ENABLED_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
+def _default_skill_library() -> SkillLibrary | None:
+    """Build the default skills library from the real engine, or None.
+
+    Lazily imports the skills package so a missing/broken engine never breaks
+    agent construction. Returns ``None`` (logged at warning) on ANY failure —
+    import error, construction error, or env-gate OFF — so callers can treat a
+    falsy return as "skills unavailable; run proceeds exactly as before skills".
+    Never raises.
+    """
+    if not _skills_enabled():
+        return None
+    try:
+        from ..skills.recall import SkillRecaller
+        from ..skills.store import SkillStore
+
+        return SkillRecaller(SkillStore())
+    except _NONFATAL_EXC as e:
+        logger.warning(
+            "skills library construction failed (%s: %s); running without SOP injection",
+            type(e).__name__, e,
+            extra={"component": "skills", "error": str(e)},
+        )
+        return None
+    except Exception as e:  # noqa: BLE001 — engine is pluggable; never fatal
+        logger.warning(
+            "skills library construction raised unexpected %s; running without SOP injection: %s",
+            type(e).__name__, e,
+            extra={"component": "skills", "error": str(e)},
+        )
+        return None
+
 
 # I2 — force-conclude fallback at the step cap.
 # When the ReAct loop exhausts ``max_steps`` without the model emitting a final
@@ -158,6 +236,7 @@ class RcaAgent:
         settings: Settings | None = None,
         max_steps: int | None = None,
         model: str | None = None,
+        skill_library: Any | None = None,
     ) -> None:
         self.provider = provider
         self.llm = llm
@@ -167,19 +246,169 @@ class RcaAgent:
         self.settings = settings or get_settings()
         self.max_steps = max_steps or self.settings.llm_max_steps
         self.model = model or self.settings.deepseek_model
+        # S4: skills library for per-fault-type SOP recall. Falls back to the
+        # default (real engine, env-gated) when no library is injected — so the
+        # production path gets SOP injection for free, while tests can inject a
+        # fake or pass None to exercise the env-gate-OFF path.
+        self.skill_library = (
+            skill_library if skill_library is not None else _default_skill_library()
+        )
 
     def _step_id(self, case_id: str) -> str:
         return f"{case_id}-{uuid.uuid4().hex[:10]}"
+
+    def _build_skill_block(self, case: Case) -> tuple[str, str | None]:
+        """Recall the best SOP for this alert and assemble the system-prompt block.
+
+        Returns ``(skill_block, loaded_skill_name)`` where ``skill_block`` is the
+        string to append to the system prompt (possibly empty) and
+        ``loaded_skill_name`` is the name of the matched skill (for the
+        display-only trace step), or ``None`` when nothing was loaded.
+
+        Never raises: every engine call is wrapped so a throwing recaller,
+        empty catalog, or env-gate-OFF all yield ``("", None)`` and the run
+        proceeds exactly as before skills. See ``run()`` for why the block is
+        system-prompt-only (durable + compaction-protected).
+        """
+        if self.skill_library is None:
+            return "", None
+
+        # Recall the single best SOP. ``best_for`` already returns None below
+        # the engine's score threshold, so we only inject a genuinely relevant
+        # SOP — never force-inject noise.
+        match: tuple[str, str] | None = None
+        try:
+            match = self.skill_library.best_for(case.task.alert_title)
+        except _NONFATAL_EXC as e:
+            logger.warning(
+                "skill best_for(%r) failed (%s: %s); running without SOP injection",
+                case.task.alert_title, type(e).__name__, e,
+                extra={
+                    "component": "skills", "case_id": case.task.task_id,
+                    "alert": case.task.alert_title, "error": str(e),
+                },
+            )
+            match = None
+        except Exception as e:  # noqa: BLE001 — engine is pluggable; never fatal
+            logger.warning(
+                "skill best_for(%r) raised unexpected %s; running without SOP injection: %s",
+                case.task.alert_title, type(e).__name__, e,
+                extra={
+                    "component": "skills", "case_id": case.task.task_id,
+                    "alert": case.task.alert_title, "error": str(e),
+                },
+            )
+            match = None
+
+        parts: list[str] = []
+        loaded_name: str | None = None
+        if match is not None:
+            # Defensive: a pluggable/fake SkillLibrary could return a wrong-
+            # arity sequence (1-tuple, 3-tuple, list) or non-str elements. The
+            # method's "Never raises" contract requires this unpack be guarded
+            # — a ValueError/TypeError from a malformed match must not abort
+            # the run. (The real SkillRecaller always returns a clean 2-tuple
+            # or None, but the Protocol invites duck-typed fakes.)
+            try:
+                name, body = match  # type: ignore[misc]
+                # Coerce so the injected block is always well-formed even if a
+                # fake returns non-str elements.
+                name = str(name) if name is not None else ""
+                body = str(body) if body is not None else ""
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "skill best_for returned malformed match %r (%s: %s); "
+                    "skipping SOP injection",
+                    match, type(e).__name__, e,
+                    extra={"component": "skills", "error": str(e)},
+                )
+                name, body = "", ""
+            if name and body:
+                loaded_name = name
+                parts.append(
+                    "\n\n# 已加载排查技能 / Loaded troubleshooting skill\n"
+                    f"<loaded_skill name=\"{name}\">\n{body}\n</loaded_skill>"
+                )
+
+        # Tier-1 disclosure: a compact catalog so the model knows what SOPs
+        # exist (without paying their full token cost). Kept small — one line
+        # per skill. A throwing catalog() yields [] and is skipped.
+        try:
+            catalog = self.skill_library.catalog()
+        except _NONFATAL_EXC as e:
+            logger.warning(
+                "skill catalog() failed (%s: %s); omitting catalog disclosure",
+                type(e).__name__, e,
+                extra={"component": "skills", "error": str(e)},
+            )
+            catalog = []
+        except Exception as e:  # noqa: BLE001 — engine is pluggable; never fatal
+            logger.warning(
+                "skill catalog() raised unexpected %s; omitting catalog disclosure: %s",
+                type(e).__name__, e,
+                extra={"component": "skills", "error": str(e)},
+            )
+            catalog = []
+
+        if catalog:
+            lines = []
+            for entry in catalog:
+                try:
+                    n, d = entry
+                    n = str(n) if n is not None else ""
+                    d = str(d) if d is not None else ""
+                except (TypeError, ValueError):
+                    continue
+                if not n:
+                    continue
+                # Cap each description so the catalog stays compact even with
+                # verbose skill metadata (the full body is already injected for
+                # the winner above).
+                lines.append(f"- {n}: {d[:120]}")
+            if lines:
+                parts.append(
+                    "\n\n# 可用技能目录 / Available skills catalog\n"
+                    "<available_skills>\n"
+                    + "\n".join(lines)
+                    + "\n</available_skills>"
+                )
+
+        return "".join(parts), loaded_name
 
     async def run(self, case: Case) -> AsyncIterator[RcaStep | RcaReport]:
         """Investigate ``case``; yield each step then the final report."""
         case_id = case.task.task_id
         _safe_otel("record_run", "started")
 
+        # S4 — Recall the single best troubleshooting SOP for this alert and
+        # inject it into the SYSTEM prompt. Injecting into the system message
+        # (always messages[0]) is deliberate and load-bearing:
+        #   * DURABLE: the system prompt is re-emitted on every turn by
+        #     ``ContextManager.assemble_turn`` (see manager.py — it always
+        #     prepends ``{"role": "system", "content": state.system}``), so the
+        #     SOP survives the entire multi-step ReAct loop without being
+        #     re-fetched.
+        #   * COMPACTION-PROTECTED: ``ContextManager.compress`` ALWAYS keeps the
+        #     system message (it is never in a droppable group — only assistant
+        #     tool-call groups and user messages are summarizable), and the I4
+        #     tool-message sliding window never touches the leading system
+        #     prefix. So the SOP is never evicted under context pressure.
+        #   * SINGLE BEST SOP (not all): the engine (S2) already picks the one
+        #     highest-scoring SOP for the alert via the keyword router; loading
+        #     every SOP would dilute the signal and bloat every prompt. The
+        #     compact <available_skills> catalog below is the tier-1 disclosure
+        #     that lets the model know other SOPs exist without paying their
+        #     token cost.
+        # Every skill call is try/except + logged: a malformed engine, a missing
+        # skills dir, or a throwing recaller yields ``skill_block=""`` and the
+        # run proceeds byte-identically to the pre-skills agent.
+        skill_block, loaded_skill_name = self._build_skill_block(case)
+
         system = (
             SYSTEM_PROMPT
             + "\n\n# 最终结论结构 / Final-answer structure\n"
             + to_final_answer_guidance()
+            + skill_block
         )
         state = self.cm.init(case_id, system)
 
@@ -204,7 +433,9 @@ class RcaAgent:
             )
             hits = []
 
-        first_user = build_initial_brief(case.task, case.topology, hits)
+        first_user = build_initial_brief(
+            case.task, case.topology, hits, skill_name=loaded_skill_name
+        )
         msgs = self.cm.assemble_turn(state, new_user=first_user)
         oa_tools = build_openai_tools(self.tools)
 
@@ -250,6 +481,44 @@ class RcaAgent:
             steps.append(mem_step)
             yield mem_step
             _safe_otel("record_step", "memory")
+
+        # S4 — Surface the loaded skill in the trace (DISPLAY ONLY).
+        # Mirrors the T3 memory step above: records that an SOP was recalled and
+        # injected, so a persisted/replayed trace shows the skills engine at
+        # work. NEVER fed to the LLM — the SOP body lives in the SYSTEM prompt
+        # (assembled into ``state.system`` above), and the ONLY thing that feeds
+        # the model below is ``self.cm.append_tool_result`` (plus the initial
+        # ``assemble_turn``, which reads ``state.system`` + the brief — this
+        # display step is not in either path). Adding it to ``steps`` lands it
+        # in the final RcaReport for display/persistence; yielding it streams it
+        # live. Wrapped in try/except so a malformed step object (or a yield
+        # failure in an exotic async runner) can never abort the run.
+        if loaded_skill_name:
+            try:
+                skill_step = RcaStep(
+                    step_id=self._step_id(case_id),
+                    case_id=case_id,
+                    step_kind=StepKind.REASONING,
+                    thought=(
+                        f"loaded skill: {loaded_skill_name} "
+                        f"(matched SOP for this alert)"
+                    ),
+                )
+                steps.append(skill_step)
+                yield skill_step
+                _safe_otel("record_step", "skill")
+            except _NONFATAL_EXC as e:
+                logger.warning(
+                    "skill display step emission failed (%s: %s); run continues",
+                    type(e).__name__, e,
+                    extra={"component": "skills", "case_id": case_id, "error": str(e)},
+                )
+            except Exception as e:  # noqa: BLE001 — display-only; never fatal
+                logger.warning(
+                    "skill display step emission raised unexpected %s; run continues: %s",
+                    type(e).__name__, e,
+                    extra={"component": "skills", "case_id": case_id, "error": str(e)},
+                )
 
         usage_total = {
             "prompt_tokens": 0,
@@ -483,16 +752,20 @@ class RcaAgent:
                 # means we could NOT get a clean answer — callers must not treat
                 # it as high conviction. Matches parse_root_cause's own
                 # prose-fallback level. Skip the display-only memory step (its
-                # thought starts with "memory:" — see run() above) so telemetry
-                # text is never surfaced as the root-cause hypothesis.
+                # thought starts with "memory:") AND the display-only skill step
+                # (its thought starts with "loaded skill:") — see run() above —
+                # so telemetry text is never surfaced as the root-cause
+                # hypothesis.
                 last_thought = ""
                 for s in reversed(steps):
+                    thought = (s.thought or "").strip()
                     if (
                         s.step_kind == StepKind.REASONING
-                        and (s.thought or "").strip()
-                        and not (s.thought or "").startswith("memory:")
+                        and thought
+                        and not thought.startswith("memory:")
+                        and not thought.startswith("loaded skill:")
                     ):
-                        last_thought = s.thought.strip()
+                        last_thought = thought
                         break
                 rc = RootCause(
                     summary=last_thought[:800]
@@ -601,4 +874,10 @@ def build_agent_for_case(
     return case, agent
 
 
-__all__ = ["RcaAgent", "build_agent_for_case"]
+__all__ = [
+    "RcaAgent",
+    "build_agent_for_case",
+    "SkillLibrary",
+    "_default_skill_library",
+    "_skills_enabled",
+]
