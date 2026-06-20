@@ -583,28 +583,19 @@ async def stream_rca(
                     )
                 except TimeoutError:
                     # Heartbeat fired: the producer has been silent for
-                    # ``heartbeat_interval``. Before re-arming the watchdog
-                    # with a ping, check whether the client has actually gone
-                    # away. sse-starlette does not reliably cancel this
-                    # generator on disconnect, so without this explicit check
-                    # the stream (and the produce() task, and the run row)
-                    # would leak until the producer finished naturally — which
-                    # for a stuck DeepSeek turn may be never. Breaking here
-                    # forces the ``finally`` to run and tear down
-                    # deterministically. ``is_disconnected()`` is best-effort;
-                    # the finally is the backstop either way.
-                    if await request.is_disconnected():
-                        logger.info(
-                            "rca_stream_client_disconnect case_id=%s run_id=%s: "
-                            "client gone during heartbeat, closing stream",
-                            case_id,
-                            effective_run_id,
-                            extra={
-                                "case_id": case_id,
-                                "run_id": effective_run_id,
-                            },
-                        )
-                        break
+                    # ``heartbeat_interval`` (e.g. a long DeepSeek reasoning
+                    # turn). Emit a NAMED ping to re-arm the client's idle
+                    # watchdog. ALWAYS ping — never break the stream here.
+                    #
+                    # Earlier this branch called ``request.is_disconnected()``
+                    # and broke on True, intending to tear down on a real client
+                    # disconnect. But Starlette's ``is_disconnected()`` is
+                    # unreliable for long-lived SSE responses behind a reverse
+                    # proxy (nginx): it returns FALSE POSITIVES, which closed
+                    # live streams ~one heartbeat into any silence — the exact
+                    # "断链" users saw. Real disconnects are handled by
+                    # sse-starlette cancelling this generator (-> ``finally``)
+                    # and, as a backstop for any leak, the orphan-run reaper.
                     seq += 1
                     # NAMED ping: ``"event": "ping"`` MUST be present so the
                     # frontend's ``addEventListener("ping")`` fires. The data
